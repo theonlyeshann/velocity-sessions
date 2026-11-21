@@ -1,3 +1,4 @@
+#include "fast_parquet.hpp"
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -110,47 +111,74 @@ struct TransparentEq {
 // Records are partitioned by the exact normalized event ID, so the earliest
 // ingested copy of an ID always arrives at the same worker, even across files.
 // mmap lifetimes extend until after all processing. No key-string copies.
+// Exact, reversible packing for a common compact-ID syntax. E.g. "e0001"
+// and "e1" have distinct packed keys. Other IDs always use exact strings.
+// No ID pattern is assumed for correctness: this is just a fast path.
+static uint64_t mix64(uint64_t v) {
+ v^=v>>30;v*=0xbf58476d1ce4e5b9ULL;
+ v^=v>>27;v*=0x94d049bb133111ebULL;
+ return v^(v>>31);
+}
+static bool packed_id(string_view s,char prefix,uint64_t& key) {
+ if(s.size()<2 || s.size()>14 || s[0]!=prefix)return false;
+ uint64_t v=0;
+ for(size_t i=1;i<s.size();++i) {
+  unsigned char c=s[i];
+  unsigned digit;
+  if(c>='0'&&c<='9')digit=c-'0';
+  else if(c>='a'&&c<='z')digit=c-'a'+10;
+  else return false;
+  if(v>((1ULL<<40)-1-digit)/36)return false;
+  v=v*36+digit;
+ }
+ key=(1ULL<<63)|(v<<8)|uint64_t(s.size()-1);
+ return true;
+}
+static uint64_t id_partition_hash(string_view s,char prefix) {
+ uint64_t packed;
+ if(packed_id(s,prefix,packed))return mix64(packed);
+ return uint64_t(hash<string_view>{}(s));
+}
+// Two exact indexes: a compact numeric index for IDs that can be packed
+// reversibly, and a full-string fallback for all other IDs.
 class EventIndex {
- struct Slot {
-  uint64_t hash=0;
-  const char* key=nullptr;
-  uint32_t key_len=0;
-  uint32_t record=0;
- };
+ struct Slot {uint64_t key=0;uint32_t record=0;uint32_t pad=0;};
+ static_assert(sizeof(Slot)==16);
  vector<Slot> slots;
- size_t mask=0, count=0;
- void rehash(size_t new_cap) {
-  vector<Slot> next(new_cap);
-  size_t m=new_cap-1;
-  for(auto const& old:slots) if(old.hash) {
-   size_t i=old.hash&m;
-   while(next[i].hash) i=(i+1)&m;
-   next[i]=old;
+ unordered_map<string_view,uint32_t,TransparentHash,TransparentEq> fallback;
+ size_t mask=0,count=0;
+ char prefix;
+ void rehash(size_t cap) {
+  vector<Slot> next(cap);size_t m=cap-1;
+  for(const auto& s:slots)if(s.key) {
+   size_t i=mix64(s.key)&m;
+   while(next[i].key)i=(i+1)&m;
+   next[i]=s;
   }
-  slots.swap(next); mask=m;
+  slots.swap(next);mask=m;
  }
 public:
- explicit EventIndex(size_t approximate_unique) {
+ explicit EventIndex(size_t approx,char p):prefix(p) {
   size_t cap=1024;
-  while(cap < approximate_unique + approximate_unique/3 + 64) cap*=2;
+  while(cap<approx+approx/3+64)cap*=2;
   rehash(cap);
  }
- pair<uint32_t,bool> locate(string_view id, uint32_t new_index) {
-  uint64_t h=uint64_t(hash<string_view>{}(id));
-  if(!h) h=1;
-  size_t i=h&mask;
-  while(slots[i].hash) {
-   auto const& s=slots[i];
-   if(s.hash==h && s.key_len==id.size() &&
-      memcmp(s.key,id.data(),id.size())==0) return {s.record,false};
+ pair<uint32_t,bool> locate(string_view id,uint32_t new_index) {
+  uint64_t packed;
+  if(!packed_id(id,prefix,packed)) {
+   auto [it,inserted]=fallback.try_emplace(id,new_index);
+   return {it->second,inserted};
+  }
+  size_t i=mix64(packed)&mask;
+  while(slots[i].key) {
+   if(slots[i].key==packed)return {slots[i].record,false};
    i=(i+1)&mask;
   }
-  if((count+1)*10 > slots.size()*7) {
-   rehash(slots.size()*2);
-   i=h&mask;
-   while(slots[i].hash) i=(i+1)&mask;
+  if((count+1)*10>slots.size()*7) {
+   rehash(slots.size()*2);i=mix64(packed)&mask;
+   while(slots[i].key)i=(i+1)&mask;
   }
-  slots[i]=Slot{h,id.data(),uint32_t(id.size()),new_index};
+  slots[i]=Slot{packed,new_index,0};
   ++count;
   return {new_index,true};
  }
@@ -160,47 +188,46 @@ public:
 // input rows. Flat indexing avoids allocating a map node and a string for each
 // previously unseen standalone user. Exact comparisons protect collisions.
 class PersonIndex {
- struct Slot {
-  uint64_t hash=0;
-  const char* ptr=nullptr;
-  uint32_t len=0;
-  uint32_t id=0;
- };
+ struct Slot {uint64_t key=0; uint32_t id=0; uint32_t pad=0;};
+ static_assert(sizeof(Slot)==16);
  vector<Slot> slots;
+ unordered_map<string_view,int,TransparentHash,TransparentEq> other;
  vector<string_view> names;
  size_t mask=0,count=0;
  void rehash(size_t cap) {
-  vector<Slot> fresh(cap);
-  size_t m=cap-1;
-  for(const auto& s:slots)if(s.hash) {
-   size_t i=s.hash&m;
-   while(fresh[i].hash)i=(i+1)&m;
+  vector<Slot> fresh(cap);size_t m=cap-1;
+  for(const auto& s:slots)if(s.key) {
+   size_t i=mix64(s.key)&m;
+   while(fresh[i].key)i=(i+1)&m;
    fresh[i]=s;
   }
   slots.swap(fresh);mask=m;
  }
-public:
- PersonIndex() {rehash(1024);}
+ public:
+ PersonIndex(){rehash(1024);}
  int get(string_view name) {
-  uint64_t h=uint64_t(hash<string_view>{}(name));
-  if(!h)h=1;
-  size_t i=h&mask;
-  while(slots[i].hash) {
-   auto const& x=slots[i];
-   if(x.hash==h && x.len==name.size() &&
-      memcmp(x.ptr,name.data(),name.size())==0)return int(x.id);
+  uint64_t packed;
+  if(!packed_id(name,'u',packed)) {
+   auto it=other.find(name);
+   if(it!=other.end())return it->second;
+   int id=int(names.size());names.push_back(name);
+   other.emplace(name,id);return id;
+  }
+  size_t i=mix64(packed)&mask;
+  while(slots[i].key) {
+   if(slots[i].key==packed)return slots[i].id;
    i=(i+1)&mask;
   }
   if((count+1)*10>slots.size()*7) {
-   rehash(slots.size()*2);i=h&mask;
-   while(slots[i].hash)i=(i+1)&mask;
+   rehash(slots.size()*2);
+   i=mix64(packed)&mask;
+   while(slots[i].key)i=(i+1)&mask;
   }
-  int id=int(names.size());
-  names.push_back(name);
-  slots[i]=Slot{h,name.data(),uint32_t(name.size()),uint32_t(id)};
-  ++count;return id;
+  int id=int(names.size());names.push_back(name);
+  slots[i]=Slot{packed,uint32_t(id),0};++count;
+  return id;
  }
- string_view name(int id)const{return names[id];}
+ string_view name(int id) const{return names[id];}
  size_t size()const{return names.size();}
 };
 
@@ -315,18 +342,39 @@ static string quote_csv(string_view s){
  if(s.find_first_of(",\"\r\n")==string::npos)return string(s);
  string r="\"";for(char c:s){if(c=='"')r+='"';r+=c;}return r+'"';
 }
-struct DSU{
- unordered_map<string,int,TransparentHash,TransparentEq> ids;vector<int> par,sz;vector<string> name;
- int get(string_view s){auto it=ids.find(s);if(it!=ids.end())return it->second;int i=par.size();ids.emplace(string(s),i);par.push_back(i);sz.push_back(1);name.emplace_back(s);return i;}
- int root(int i){while(par[i]!=i){par[i]=par[par[i]];i=par[i];}return i;}
- void join(int a,int b){a=root(a);b=root(b);if(a==b)return;if(sz[a]<sz[b])swap(a,b);par[b]=a;sz[a]+=sz[b];if(byte_less(name[b],name[a]))name[a]=name[b];}
-  string_view canonical(string_view id) const {
-   auto it=ids.find(id);
-   if(it==ids.end())return id;
-   int r=it->second;
-   while(par[r]!=r)r=par[r];
-   return name[r];
+struct DSU {
+ unordered_map<uint64_t,int> packed;
+ unordered_map<string,int,TransparentHash,TransparentEq> other;
+ vector<int> par,sz;
+ vector<string> name;
+ int lookup(string_view s)const {
+  uint64_t key;
+  if(packed_id(s,'u',key)) {
+   auto it=packed.find(key);return it==packed.end()?-1:it->second;
   }
+  auto it=other.find(s);return it==other.end()?-1:it->second;
+ }
+ int get(string_view s) {
+  int old=lookup(s);if(old>=0)return old;
+  int i=int(par.size());
+  uint64_t key;
+  if(packed_id(s,'u',key))packed.emplace(key,i);
+  else other.emplace(string(s),i);
+  par.push_back(i);sz.push_back(1);name.emplace_back(s);
+  return i;
+ }
+ int root(int i) {while(par[i]!=i){par[i]=par[par[i]];i=par[i];}return i;}
+ void join(int a,int b) {
+  a=root(a);b=root(b);if(a==b)return;
+  if(sz[a]<sz[b])swap(a,b);
+  par[b]=a;sz[a]+=sz[b];
+  if(byte_less(name[b],name[a]))name[a]=name[b];
+ }
+ string_view canonical(string_view id)const {
+  int r=lookup(id);if(r<0)return id;
+  while(par[r]!=r)r=par[r];
+  return name[r];
+ }
 };
 // 32 bytes per winner instead of seven std::strings per raw event.
 // user == -1 marks the earliest copy as invalid; later copies must not rescue it.
@@ -406,7 +454,7 @@ int main(int argc,char**argv){
     const char* e=nl?nl:ch.last;
     string_view id=first_field(p,size_t(e-p));
     if(!id.empty()) {
-     size_t h=hash<string_view>{}(id);
+     uint64_t h=id_partition_hash(id,'e');
      unsigned shard=unsigned((h>>32)%workers);
      shards[shard].push_back({p,size_t(e-p)});
     }
@@ -423,7 +471,7 @@ int main(int argc,char**argv){
   for(unsigned r=0;r<workers;++r)count+=local[r][t].size();
   auto& out_events=results[t];
   out_events.reserve(count);
-  EventIndex index(count);
+  EventIndex index(count,'e');
   array<string_view,7> f;
   for(unsigned r=0;r<workers;++r) {
    for(RowRef row:local[r][t]) {
@@ -476,37 +524,105 @@ int main(int argc,char**argv){
  });
  checkpoint("Parallel exact dedup + event validation");
  vector<vector<vector<RowRef>>>().swap(local);
+ // Each worker resolves its own canonical names to *local* 32-bit IDs.
+ // A global merge touches distinct names only, not millions of event rows.
+ vector<PersonIndex> local_persons(workers);
+ vector<vector<Event>> event_parts(workers);
+ worker_error=nullptr;
+ launch([&](unsigned t) {
+  auto& dst=event_parts[t];
+  auto& local_ids=local_persons[t];
+  dst.reserve(results[t].size());
+  for(const auto& r:results[t])
+   dst.push_back(Event{r.ts,r.ingest,local_ids.get(dsu.canonical(r.user)),r.prod,r.price,r.kind});
+  vector<PendingEvent>().swap(results[t]);
+ });
  PersonIndex persons;
+ vector<vector<int>> event_translate(workers);
+ for(unsigned t=0;t<workers;++t) {
+  auto& map=event_translate[t];
+  map.reserve(local_persons[t].size());
+  for(size_t i=0;i<local_persons[t].size();++i)
+   map.push_back(persons.get(local_persons[t].name(int(i))));
+ }
+ worker_error=nullptr;
+ launch([&](unsigned t) {
+  for(Event& e:event_parts[t])e.user=event_translate[t][e.user];
+ });
  vector<Event> events;
- size_t total_valid=0;
- for(size_t n:winning)total_valid+=n;
+ size_t total_valid=0;for(auto n:winning)total_valid+=n;
  events.reserve(total_valid);
- for(auto& part:results) {
-  for(auto const& r:part)
-   events.push_back(Event{r.ts,r.ingest,persons.get(dsu.canonical(r.user)),r.prod,r.price,r.kind});
-  vector<PendingEvent>().swap(part);
+ for(auto& part:event_parts) {
+  events.insert(events.end(),make_move_iterator(part.begin()),make_move_iterator(part.end()));
+  vector<Event>().swap(part);
  }
  checkpoint("Resolve deduplicated user IDs");
  MappedInput mapped_clicks(files(data/"clicks"));
- vector<Click> clicks;
- unordered_set<string_view,TransparentHash,TransparentEq> seen;
- array<string_view,4> f;
- for(const auto& chunk:mapped_clicks.chunks) {
-  const char* p=chunk.first;
-  while(p<chunk.last) {
-   const char* nl=(const char*)memchr(p,'\n',size_t(chunk.last-p));
-   const char* end=nl?nl:chunk.last;
-   if(csv_split4(p,size_t(end-p),f) && !f[0].empty() && seen.emplace(f[0]).second) {
-    if(!f[1].empty()) {
-     i64 ts;
-     if(parse_ts(f[3],ts) && ts>=ws-WEEK && ts<we) {
-      auto ci=campaignIds.find(f[2]);
-      if(ci!=campaignIds.end())clicks.push_back({persons.get(dsu.canonical(f[1])),ci->second,ts,f[0]});
-     }
+ vector<vector<vector<RowRef>>> click_rows(workers,vector<vector<RowRef>>(workers));
+ chunk_cursor.store(0);
+ worker_error=nullptr;
+ launch([&](unsigned t) {
+  auto& shard=click_rows[t];
+  while(true) {
+   size_t idx=chunk_cursor.fetch_add(1,memory_order_relaxed);
+   if(idx>=mapped_clicks.chunks.size())break;
+   Chunk ch=mapped_clicks.chunks[idx];
+   const char* p=ch.first;
+   while(p<ch.last) {
+    const char* nl=(const char*)memchr(p,'\n',size_t(ch.last-p));
+    const char* end=nl?nl:ch.last;
+    string_view id=first_field(p,size_t(end-p));
+    if(!id.empty()) {
+     uint64_t h=id_partition_hash(id,'k');
+     unsigned bucket=unsigned((h>>32)%workers);
+     shard[bucket].push_back({p,size_t(end-p)});
     }
+    p=nl?nl+1:ch.last;
    }
-   p=nl?nl+1:chunk.last;
   }
+ });
+ vector<vector<Click>> click_parts(workers);
+ vector<PersonIndex> click_persons(workers);
+ worker_error=nullptr;
+ launch([&](unsigned t) {
+  size_t n=0;
+  for(unsigned j=0;j<workers;++j)n+=click_rows[j][t].size();
+  EventIndex seen(n,'k');
+  auto& dest=click_parts[t];
+  auto& ids=click_persons[t];
+  dest.reserve(n);
+  array<string_view,4> f;
+  for(unsigned j=0;j<workers;++j) {
+   for(const auto& row:click_rows[j][t]) {
+    if(!csv_split4(row.p,row.n,f)||f[0].empty())continue;
+    auto [ignored,inserted]=seen.locate(f[0],0);
+    if(!inserted||f[1].empty())continue;
+    i64 ts;
+    if(!parse_ts(f[3],ts)||ts<ws-WEEK||ts>=we)continue;
+    auto ci=campaignIds.find(f[2]);
+    if(ci==campaignIds.end())continue;
+    dest.push_back({ids.get(dsu.canonical(f[1])),ci->second,ts,f[0]});
+   }
+   vector<RowRef>().swap(click_rows[j][t]);
+  }
+ });
+ vector<vector<int>> click_translate(workers);
+ for(unsigned t=0;t<workers;++t) {
+  auto& map=click_translate[t];
+  map.reserve(click_persons[t].size());
+  for(size_t i=0;i<click_persons[t].size();++i)
+   map.push_back(persons.get(click_persons[t].name(int(i))));
+ }
+ worker_error=nullptr;
+ launch([&](unsigned t) {
+  for(auto& c:click_parts[t])c.user=click_translate[t][c.user];
+ });
+ vector<Click> clicks;
+ size_t nc=0; for(auto& part:click_parts)nc+=part.size();
+ clicks.reserve(nc);
+ for(auto& part:click_parts) {
+  clicks.insert(clicks.end(),make_move_iterator(part.begin()),make_move_iterator(part.end()));
+  vector<Click>().swap(part);
  }
  checkpoint("Read + validate clicks");
  auto sort_by_person=[&](auto& records,auto less) {
@@ -576,6 +692,56 @@ int main(int argc,char**argv){
  }
  checkpoint("Click attribution + campaign aggregation");
  fs::create_directories(out/"user_daily");fs::create_directories(out/"campaign_daily");
+ if(const char* f=getenv("VELOCITY_NATIVE_PARQUET"); f && string_view(f)=="1"){
+  vector<const UserDay*> user_rows;
+  user_rows.reserve(ud.size());
+  for(const auto& entry:ud)user_rows.push_back(&entry.second);
+  vector<const CampDay*> camp_rows;
+  camp_rows.reserve(cd.size());
+  for(const auto& entry:cd)camp_rows.push_back(&entry.second);
+  using namespace fastparquet;
+  write((out/"user_daily"/"part-00000.parquet").string(),
+   {{"user_id",BYTE_ARRAY,false,0},{"day",INT32,false,6},
+    {"sessions",INT64},{"events",INT64},{"revenue_cents",INT64},
+    {"top_category",BYTE_ARRAY,true,0}},user_rows.size(),
+   [&](size_t row,size_t col)->Value{
+    const UserDay& u=*user_rows[row];
+    switch(col){
+     case 0:return {true,persons.name(u.person),0};
+     case 1:return {true,{},u.day};
+     case 2:return {true,{},u.sessions};
+     case 3:return {true,{},u.events};
+     case 4:return {true,{},u.revenue};
+     default: {
+      bool found=false;int bestid=0;long long best=-1;
+      for(const auto& [id,v]:u.categories)
+       if(v>best || (v==best && byte_less(cats[id],cats[bestid])))
+         {best=v;bestid=id;found=true;}
+      return {found,found?string_view(cats[bestid]):string_view{},0};
+     }
+    }
+   });
+  write((out/"campaign_daily"/"part-00000.parquet").string(),
+   {{"campaign_id",BYTE_ARRAY,false,0},{"channel",BYTE_ARRAY,false,0},
+    {"day",INT32,false,6},{"sessions",INT64},
+    {"purchasing_sessions",INT64},{"revenue_cents",INT64},{"assisted_sessions",INT64}},
+   camp_rows.size(),[&](size_t row,size_t col)->Value{
+    const CampDay& c=*camp_rows[row];
+    switch(col){
+     case 0:return {true,campaignNames[c.campaign],0};
+     case 1:return {true,channels[c.campaign],0};
+     case 2:return {true,{},c.day};
+     case 3:return {true,{},c.sessions};
+     case 4:return {true,{},c.purchasing};
+     case 5:return {true,{},c.revenue};
+     default:return {true,{},c.assists};
+    }
+   });
+  checkpoint("Native Parquet serialization");
+  cerr<<"[velocity] events="<<events.size()<<" clicks="<<clicks.size()<<" sessions="<<sessions.size()<<" user_days="<<ud.size()<<" campaign_days="<<cd.size()<<" native_seconds="<<chrono::duration<double>(chrono::steady_clock::now()-tick).count()<<"\n";
+  return 0;
+ }
+
  ofstream uf(out/"user_daily"/"result.csv",ios::binary);
  uf<<"user_id,day,sessions,events,revenue_cents,top_category\n";
  for(auto&[k,u]:ud){string cat;bool found=false; i64 best=-1;
