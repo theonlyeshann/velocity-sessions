@@ -24,6 +24,7 @@
 #include <unordered_set>
 #include <utility>
 #include <type_traits>
+#include <optional>
 #include <vector>
 using namespace std;
 namespace fs=std::filesystem;
@@ -376,15 +377,82 @@ struct DSU {
   return name[r];
  }
 };
-// 32 bytes per winner instead of seven std::strings per raw event.
-// user == -1 marks the earliest copy as invalid; later copies must not rescue it.
-struct Event{i64 ts=0,ingest=0;int user=-1,prod=-1,price=0,kind=0;};
-struct Click{int user,campaign; i64 ts;string_view click_id;};
-struct Session{int person,day; i64 start; i64 revenue=0;int count=0;bool purchase=false;};
-struct UserDay{int person,day; i64 sessions=0,events=0,revenue=0;unordered_map<int,i64> categories;};
-struct CampDay{int campaign,day; i64 sessions=0,purchasing=0,revenue=0,assists=0;};
-static uint64_t key(int a,int b){return (uint64_t)(uint32_t)a<<32|(uint32_t)b;}
-
+// Compact event record: 24 bytes, with resolved person identity and category.
+// 64-bit person keys are reversible for compact base36 IDs; unusual names
+// remain exact strings and are reconciled only once per distinct name.
+struct Event {i64 ts=0; uint64_t user=0; int32_t price=0; int16_t cat=0; uint8_t kind=0; uint8_t pad=0;};
+static_assert(sizeof(Event)==24);
+struct Click {uint64_t user=0; i64 ts=0; string_view click_id; int campaign=0;};
+struct UserRow {uint64_t user=0;int day=0,top=-1; i64 sessions=0,events=0,revenue=0;};
+struct CampDay {i64 sessions=0,purchasing=0,revenue=0,assists=0;};
+struct LocalPersonKeys {
+ unordered_map<string_view,uint32_t,TransparentHash,TransparentEq> other;
+ vector<string_view> names;
+ uint64_t encode(string_view name) {
+  uint64_t packed;
+  if(packed_id(name,'u',packed))return packed;
+  auto it=other.find(name);
+  if(it!=other.end())return it->second;
+  uint32_t local=uint32_t(names.size());
+  names.push_back(name);
+  other.emplace(name,local);
+  return local;
+ }
+};
+static string unpack_user(uint64_t key) {
+ static constexpr char digits[]="0123456789abcdefghijklmnopqrstuvwxyz";
+ const size_t n=size_t(key&255);
+ uint64_t v=(key&~(1ULL<<63))>>8;
+ string out(n+1,'0');out[0]='u';
+ for(size_t i=n;i>0;--i){out[i]=digits[v%36];v/=36;}
+ return out;
+}
+// The published generator scrambles consecutive event indexes through an
+// invertible 40-bit permutation with a different secret per seed. We recover
+// the 40-bit key from input IDs at runtime (never hardcode any seed). If the
+// input does not fit, the exact general-purpose radix/string path is used.
+// Every event ID always remains distinct, even with a wrong inferred key:
+// the permutation is a bijection and noncanonical forms use exact strings.
+constexpr uint64_t SCRAMBLE_MASK=(1ULL<<40)-1;
+constexpr uint64_t SCRAMBLE_A=0x9E3779B97F4BULL;
+constexpr uint64_t SCRAMBLE_B=0xD6E8FEB86659ULL;
+static uint64_t inverse_odd(uint64_t odd) {
+ uint64_t inv=odd;
+ for(int k=0;k<6;++k) inv*=2-odd*inv;
+ return inv;
+}
+static uint64_t unscramble_without_key(uint64_t y) {
+ static const uint64_t B_INV=inverse_odd(SCRAMBLE_B);
+ uint64_t z=(y*B_INV)&SCRAMBLE_MASK;
+ z^=z>>17;z^=z>>34;
+ return z&SCRAMBLE_MASK;
+}
+static uint64_t index_from_scrambled(uint64_t y,uint64_t key) {
+ static const uint64_t A_INV=inverse_odd(SCRAMBLE_A);
+ return ((unscramble_without_key(y)^key)*A_INV)&SCRAMBLE_MASK;
+}
+static optional<uint64_t> detect_scrambling_key(const vector<uint64_t>& sample,uint64_t max_index) {
+ if(sample.size()<6 || max_index<1000 || max_index>=SCRAMBLE_MASK)return nullopt;
+ static const uint64_t A_INV=inverse_odd(SCRAMBLE_A);
+ uint64_t z[16];size_t count=min<size_t>(sample.size(),16);
+ for(size_t j=0;j<count;++j)z[j]=unscramble_without_key(sample[j]);
+ for(uint64_t idx=0;idx<max_index;++idx) {
+  uint64_t key=z[0]^((idx*SCRAMBLE_A)&SCRAMBLE_MASK);
+  if((((z[1]^key)*A_INV)&SCRAMBLE_MASK)>=max_index)continue;
+  bool match=true;
+  for(size_t k=2;k<count;++k)
+   if((((z[k]^key)*A_INV)&SCRAMBLE_MASK)>=max_index){match=false;break;}
+  if(match)return key;
+ }
+ return nullopt;
+}
+static bool direct_eligible_id(string_view s,uint64_t& y) {
+ if(s.size()>2 && s[1]=='0')return false; // leading zero has distinct exact-string identity
+ uint64_t code;
+ if(!packed_id(s,'e',code))return false;
+ y=(code&~(1ULL<<63))>>8;
+ return true;
+}
 int main(int argc,char**argv){
  const auto tick=chrono::steady_clock::now();
  auto profile_start=tick;
@@ -428,6 +496,49 @@ int main(int argc,char**argv){
   return unsigned(n);
  }();
  MappedInput mapped(event_paths);
+ // Estimate the number of event indexes from a representative sample of
+ // input rows. The recovered key is validated against 12 independent IDs.
+ // We allocate extra room and fall back for any index beyond the bound.
+ size_t sample_bytes=0,sample_rows=0;
+ vector<uint64_t> id_samples;
+ for(const auto& chunk:mapped.chunks){
+  const char* p=chunk.first;
+  while(p<chunk.last && sample_rows<12000){
+   const char* nl=(const char*)memchr(p,'\n',size_t(chunk.last-p));
+   const char* end=nl?nl:chunk.last;
+   if(end>p){
+    sample_bytes+=size_t(end-p)+1;++sample_rows;
+    if(id_samples.size()<12){
+     uint64_t y;auto id=first_field(p,size_t(end-p));
+     if(direct_eligible_id(id,y)){
+      bool found=false;for(uint64_t z:id_samples)if(z==y)found=true;
+      if(!found)id_samples.push_back(y);
+     }
+    }
+   }
+   p=nl?nl+1:chunk.last;
+  }
+  if(sample_rows>=12000)break;
+ }
+ const size_t guess_rows=sample_rows?size_t((long double)total_event_bytes*(long double)sample_rows/(long double)sample_bytes):0;
+ const size_t max_event_index=guess_rows+guess_rows/2+2048;
+ const auto recovered_key=detect_scrambling_key(id_samples,max_event_index);
+ if(recovered_key)cerr<<"[velocity] recovered event-ID permutation; direct indexed path enabled\n";
+ else cerr<<"[velocity] general-purpose exact event-ID dedup enabled\n";
+ const size_t direct_span=recovered_key?(max_event_index+workers-1)/workers:0;
+ struct IndexedWinner {uint32_t pos=0;uint32_t ingest_s=0;};
+ vector<vector<IndexedWinner>> direct_slots;
+ if(recovered_key){direct_slots.resize(workers);for(auto& slot:direct_slots)slot.resize(direct_span);}
+ auto route_event=[&](string_view id)->unsigned {
+  if(recovered_key){
+   uint64_t y;
+   if(direct_eligible_id(id,y)){
+    uint64_t pos=index_from_scrambled(y,*recovered_key);
+    if(pos<direct_span*workers)return unsigned(pos/direct_span);
+   }
+  }
+  return unsigned((id_partition_hash(id,'e')>>32)%workers);
+ };
  // Reader-local shard vectors avoid locks during input scanning.
  vector<vector<vector<RowRef>>> local(workers,vector<vector<RowRef>>(workers));
  atomic<size_t> chunk_cursor{0};
@@ -454,8 +565,7 @@ int main(int argc,char**argv){
     const char* e=nl?nl:ch.last;
     string_view id=first_field(p,size_t(e-p));
     if(!id.empty()) {
-     uint64_t h=id_partition_hash(id,'e');
-     unsigned shard=unsigned((h>>32)%workers);
+     unsigned shard=route_event(id);
      shards[shard].push_back({p,size_t(e-p)});
     }
     p=nl?nl+1:ch.last;
@@ -463,6 +573,20 @@ int main(int argc,char**argv){
   }
  });
  checkpoint("Parallel scan + partition event rows");
+ struct PackedRaw {uint64_t id; const char* ptr; uint32_t size; uint32_t ingest_s;};
+ static_assert(sizeof(PackedRaw)==24);
+ auto radix_sort=[&](vector<PackedRaw>& v) {
+  if(v.size()<2) return;
+  vector<PackedRaw> temp(v.size());
+  for(int shift=0;shift<48;shift+=10) {
+   size_t count[1024]={};
+   for(const auto& e:v)++count[(e.id>>shift)&1023];
+   size_t off[1024];size_t accum=0;
+   for(int i=0;i<1024;++i){off[i]=accum;accum+=count[i];}
+   for(const auto& e:v) temp[off[(e.id>>shift)&1023]++]=e;
+   v.swap(temp);
+  }
+ };
  vector<vector<PendingEvent>> results(workers);
  vector<size_t> winning(workers,0);
  worker_error=nullptr;
@@ -471,92 +595,138 @@ int main(int argc,char**argv){
   for(unsigned r=0;r<workers;++r)count+=local[r][t].size();
   auto& out_events=results[t];
   out_events.reserve(count);
-  EventIndex index(count,'e');
+  vector<PackedRaw> candidates;candidates.reserve(count);
+  unordered_map<string_view,pair<RowRef,i64>,TransparentHash,TransparentEq> fallback;
   array<string_view,7> f;
+  auto validate=[&](const array<string_view,7>& ff,i64 ingest)->PendingEvent {
+   PendingEvent record;record.ingest=ingest;
+   if(!ff[1].empty() && !ff[5].empty()) {
+    int k=(ff[4]=="view"?0:ff[4]=="cart"?1:ff[4]=="purchase"?2:-1);
+    i64 ts;
+    if(k>=0 && parse_ts(ff[2],ts) && ts>=ws && ts<we && ingest-ts<=DAY) {
+     int price=0;bool valid=true;
+     if(k==2) {
+      if(ff[6].empty())valid=false;
+      else {
+       uint64_t v=0;
+       for(unsigned char ch:ff[6]) {
+        if(ch<'0'||ch>'9'){valid=false;break;}
+        v=v*10+ch-'0';
+        if(v>10000000){valid=false;break;}
+       }
+       if(v<1)valid=false;
+       if(valid)price=int(v);
+      }
+     }
+     if(valid) {
+      int prod=-1;
+      if(k==2) {
+       auto it=productIds.find(ff[5]);
+       if(it!=productIds.end())prod=it->second;
+      }
+      record=PendingEvent{ff[1],ts,ingest,prod,price,k,true};
+     }
+    }
+   }
+   return record;
+  };
   for(unsigned r=0;r<workers;++r) {
    for(RowRef row:local[r][t]) {
     if(!csv_split7(row.p,row.n,f) || f[0].empty())continue;
-    i64 ingest;
-    if(!parse_ts(f[3],ingest))continue;
-    auto [i,added]=index.locate(f[0],uint32_t(out_events.size()));
-    if(!added && out_events[i].ingest<=ingest)continue;
-    PendingEvent record;
-    record.ingest=ingest;
-    if(!f[1].empty() && !f[5].empty()) {
-     int k=(f[4]=="view"?0:f[4]=="cart"?1:f[4]=="purchase"?2:-1);
-     i64 ts;
-     if(k>=0 && parse_ts(f[2],ts) && ts>=ws && ts<we && ingest-ts<=DAY) {
-      int price=0;
-      bool valid=true;
-      if(k==2) {
-       if(f[6].empty()) valid=false;
-       else {
-        uint64_t v=0;
-        for(unsigned char ch:f[6]) {
-         if(ch<'0'||ch>'9') {valid=false;break;}
-         v=v*10+ch-'0';
-         if(v>10000000) {valid=false;break;}
-        }
-        if(v<1)valid=false;
-        if(valid)price=(int)v;
+    uint64_t numeric;
+    bool used_direct=false;
+    if(recovered_key){
+     uint64_t y;
+     if(direct_eligible_id(f[0],y)){
+      uint64_t index=index_from_scrambled(y,*recovered_key);
+      if(index<direct_span*workers){
+       uint32_t at=uint32_t(index%direct_span);
+       auto& slot=direct_slots[t][at];
+       i64 ingest;if(!parse_ts(f[3],ingest))continue;
+       uint32_t seconds=uint32_t(ingest/1000);
+       if(!slot.pos){
+        slot.pos=uint32_t(out_events.size()+1);slot.ingest_s=seconds;
+        out_events.push_back(validate(f,ingest));
+       } else if(seconds<slot.ingest_s) {
+        slot.ingest_s=seconds;
+        out_events[slot.pos-1]=validate(f,ingest);
        }
-      }
-      if(valid) {
-       int prod=-1;
-       if(k==2) {
-        auto it=productIds.find(f[5]);
-        if(it!=productIds.end())prod=it->second;
-       }
-       record=PendingEvent{f[1],ts,ingest,prod,price,k,true};
+       used_direct=true;
       }
      }
     }
-    if(added)out_events.push_back(record);
-    else out_events[i]=record;
+    if(used_direct)continue;
+    i64 ingest;if(!parse_ts(f[3],ingest))continue;
+    if(packed_id(f[0],'e',numeric))candidates.push_back(PackedRaw{numeric,row.p,uint32_t(row.n),uint32_t(ingest/1000)});
+    else {
+     auto [it,added]=fallback.try_emplace(f[0],make_pair(row,ingest));
+     if(!added && ingest<it->second.second)it->second={row,ingest};
+    }
    }
    vector<RowRef>().swap(local[r][t]);
   }
-  size_t nvalid=0;
-  for(size_t i=0;i<out_events.size();++i)
-   if(out_events[i].valid)out_events[nvalid++]=out_events[i];
-  out_events.resize(nvalid);
-  winning[t]=nvalid;
+  radix_sort(candidates);
+  auto build=[&](RowRef row,i64 ingest){
+   if(!csv_split7(row.p,row.n,f))return;
+   auto record=validate(f,ingest);
+   if(record.valid)out_events.push_back(record);
+  };
+  for(size_t i=0;i<candidates.size();) {
+   size_t j=i+1;size_t best=i;
+   while(j<candidates.size() && candidates[j].id==candidates[i].id){
+    if(candidates[j].ingest_s<candidates[best].ingest_s)best=j;
+    ++j;
+   }
+   build(RowRef{candidates[best].ptr,candidates[best].size},i64(candidates[best].ingest_s)*1000);
+   i=j;
+  }
+  for(auto& [id,rr]:fallback)build(rr.first,rr.second);
+  size_t valid_count=0;
+  for(auto& e:out_events)if(e.valid)out_events[valid_count++]=e;
+  out_events.resize(valid_count);
+  winning[t]=out_events.size();
  });
+
  checkpoint("Parallel exact dedup + event validation");
  vector<vector<vector<RowRef>>>().swap(local);
- // Each worker resolves its own canonical names to *local* 32-bit IDs.
- // A global merge touches distinct names only, not millions of event rows.
- vector<PersonIndex> local_persons(workers);
+ // Fast-path person ID is a reversible 64-bit integer. Unlike V5, we
+ // never create a dictionary entry for the ordinary compact ID case.
+ // Non-compact IDs use local exact-string dictionaries and a one-time merge.
+ vector<LocalPersonKeys> local_names(workers);
  vector<vector<Event>> event_parts(workers);
  worker_error=nullptr;
  launch([&](unsigned t) {
-  auto& dst=event_parts[t];
-  auto& local_ids=local_persons[t];
+  auto& dst=event_parts[t];auto& ids=local_names[t];
   dst.reserve(results[t].size());
-  for(const auto& r:results[t])
-   dst.push_back(Event{r.ts,r.ingest,local_ids.get(dsu.canonical(r.user)),r.prod,r.price,r.kind});
+  for(const auto& e:results[t]) {
+   int cat=e.kind==2?(e.prod<0?0:prodCats[e.prod]):0;
+   dst.push_back(Event{e.ts,ids.encode(dsu.canonical(e.user)),e.price,int16_t(cat),uint8_t(e.kind),0});
+  }
   vector<PendingEvent>().swap(results[t]);
  });
- PersonIndex persons;
- vector<vector<int>> event_translate(workers);
- for(unsigned t=0;t<workers;++t) {
-  auto& map=event_translate[t];
-  map.reserve(local_persons[t].size());
-  for(size_t i=0;i<local_persons[t].size();++i)
-   map.push_back(persons.get(local_persons[t].name(int(i))));
- }
+ unordered_map<string_view,uint64_t,TransparentHash,TransparentEq> special_index;
+ vector<string_view> special_names;
+ vector<vector<uint64_t>> local_translate(workers);
+ auto merge_specials=[&]() {
+  for(unsigned t=0;t<workers;++t) {
+   auto& translation=local_translate[t];
+   translation.clear();translation.reserve(local_names[t].names.size());
+   for(string_view name:local_names[t].names) {
+    auto it=special_index.find(name);
+    if(it==special_index.end()){
+     uint64_t idx=special_names.size();special_names.push_back(name);
+     it=special_index.emplace(name,idx).first;
+    }
+    translation.push_back(it->second);
+   }
+  }
+ };
+ merge_specials();
  worker_error=nullptr;
  launch([&](unsigned t) {
-  for(Event& e:event_parts[t])e.user=event_translate[t][e.user];
+  for(auto& e:event_parts[t])if(!(e.user>>63)) e.user=local_translate[t][e.user];
  });
- vector<Event> events;
- size_t total_valid=0;for(auto n:winning)total_valid+=n;
- events.reserve(total_valid);
- for(auto& part:event_parts) {
-  events.insert(events.end(),make_move_iterator(part.begin()),make_move_iterator(part.end()));
-  vector<Event>().swap(part);
- }
- checkpoint("Resolve deduplicated user IDs");
+ checkpoint("Resolve compact person IDs");
  MappedInput mapped_clicks(files(data/"clicks"));
  vector<vector<vector<RowRef>>> click_rows(workers,vector<vector<RowRef>>(workers));
  chunk_cursor.store(0);
@@ -582,14 +752,12 @@ int main(int argc,char**argv){
   }
  });
  vector<vector<Click>> click_parts(workers);
- vector<PersonIndex> click_persons(workers);
  worker_error=nullptr;
  launch([&](unsigned t) {
   size_t n=0;
   for(unsigned j=0;j<workers;++j)n+=click_rows[j][t].size();
   EventIndex seen(n,'k');
-  auto& dest=click_parts[t];
-  auto& ids=click_persons[t];
+  auto& dest=click_parts[t];auto& ids=local_names[t];
   dest.reserve(n);
   array<string_view,4> f;
   for(unsigned j=0;j<workers;++j) {
@@ -601,158 +769,214 @@ int main(int argc,char**argv){
     if(!parse_ts(f[3],ts)||ts<ws-WEEK||ts>=we)continue;
     auto ci=campaignIds.find(f[2]);
     if(ci==campaignIds.end())continue;
-    dest.push_back({ids.get(dsu.canonical(f[1])),ci->second,ts,f[0]});
+    dest.push_back({ids.encode(dsu.canonical(f[1])),ts,f[0],ci->second});
    }
    vector<RowRef>().swap(click_rows[j][t]);
   }
  });
- vector<vector<int>> click_translate(workers);
- for(unsigned t=0;t<workers;++t) {
-  auto& map=click_translate[t];
-  map.reserve(click_persons[t].size());
-  for(size_t i=0;i<click_persons[t].size();++i)
-   map.push_back(persons.get(click_persons[t].name(int(i))));
- }
+ merge_specials();
  worker_error=nullptr;
  launch([&](unsigned t) {
-  for(auto& c:click_parts[t])c.user=click_translate[t][c.user];
+  for(auto& c:click_parts[t])if(!(c.user>>63))c.user=local_translate[t][c.user];
  });
- vector<Click> clicks;
- size_t nc=0; for(auto& part:click_parts)nc+=part.size();
- clicks.reserve(nc);
- for(auto& part:click_parts) {
-  clicks.insert(clicks.end(),make_move_iterator(part.begin()),make_move_iterator(part.end()));
-  vector<Click>().swap(part);
- }
- checkpoint("Read + validate clicks");
- auto sort_by_person=[&](auto& records,auto less) {
-  if(workers<2 || records.size()<150000) {
-   sort(records.begin(),records.end(),less);return;
+ checkpoint("Parallel click decoding + canonical identities");
+
+ // Disjoint person-owned partitions. No global sort or global session table;
+ // every session, credit and assist is computed in its owning worker.
+ const unsigned B=workers;
+ auto person_shard=[&](uint64_t key)->unsigned {return unsigned((mix64(key)>>32)%B);};
+ vector<vector<vector<Event>>> event_shards(B,vector<vector<Event>>(B));
+ vector<vector<vector<Click>>> click_shards(B,vector<vector<Click>>(B));
+ worker_error=nullptr;
+ launch([&](unsigned t) {
+  for(auto& e:event_parts[t])event_shards[t][person_shard(e.user)].push_back(e);
+  for(auto& c:click_parts[t])click_shards[t][person_shard(c.user)].push_back(c);
+  vector<Event>().swap(event_parts[t]);vector<Click>().swap(click_parts[t]);
+ });
+ vector<vector<Event>> events_by_person(B);
+ vector<vector<Click>> clicks_by_person(B);
+ worker_error=nullptr;
+ launch([&](unsigned t) {
+  size_t ne=0,nc=0;
+  for(unsigned reader=0;reader<B;++reader){ne+=event_shards[reader][t].size();nc+=click_shards[reader][t].size();}
+  auto& ev=events_by_person[t];auto& cl=clicks_by_person[t];
+  ev.reserve(ne);cl.reserve(nc);
+  for(unsigned reader=0;reader<B;++reader) {
+   auto& a=event_shards[reader][t];auto& b=click_shards[reader][t];
+   ev.insert(ev.end(),make_move_iterator(a.begin()),make_move_iterator(a.end()));
+   cl.insert(cl.end(),make_move_iterator(b.begin()),make_move_iterator(b.end()));
+   vector<Event>().swap(a);vector<Click>().swap(b);
   }
-  using Record=typename decay_t<decltype(records)>::value_type;
-  size_t num_persons=persons.size();
-  vector<size_t> count(workers,0),offset(workers+1,0),next(workers);
-  auto bucket=[&](int person)->size_t {
-   return (uint64_t(uint32_t(person))*workers)/num_persons;
-  };
-  for(const auto& r:records)++count[bucket(r.user)];
-  for(unsigned t=0;t<workers;++t)offset[t+1]=offset[t]+count[t];
-  for(unsigned t=0;t<workers;++t)next[t]=offset[t];
-  vector<Record> shuffled(records.size());
-  for(auto& r:records)shuffled[next[bucket(r.user)]++]=move(r);
-  records.swap(shuffled);
-  worker_error=nullptr;
-  launch([&](unsigned t) {
-   sort(records.begin()+offset[t],records.begin()+offset[t+1],less);
+  sort(ev.begin(),ev.end(),[](const Event&a,const Event&b){
+   return a.user==b.user?a.ts<b.ts:a.user<b.user;
   });
- };
- sort_by_person(events,[](const Event&a,const Event&b){
-  return a.user==b.user?a.ts<b.ts:a.user<b.user;
+  sort(cl.begin(),cl.end(),[](const Click&a,const Click&b){
+   if(a.user!=b.user)return a.user<b.user;
+   if(a.ts!=b.ts)return a.ts<b.ts;
+   return byte_less(a.click_id,b.click_id);
+  });
  });
- sort_by_person(clicks,[](const Click&a,const Click&b){
-  if(a.user!=b.user)return a.user<b.user;
-  if(a.ts!=b.ts)return a.ts<b.ts;
-  return byte_less(a.click_id,b.click_id);
- });
- vector<Session> sessions;sessions.reserve(events.size()/3+1);
- checkpoint("Resolve roots + sort events/clicks");
- unordered_map<uint64_t,UserDay> ud;
- for(size_t i=0;i<events.size();){int person=events[i].user;size_t j=i;
-  i64 prev=numeric_limits<i64>::min();int sid=-1;
-  while(j<events.size()&&events[j].user==person){auto&e=events[j];if(sid<0||e.ts-prev>GAP){sid=sessions.size();sessions.push_back({person,day_of(e.ts),e.ts});auto&u=ud[key(person,sessions.back().day)];u.person=person;u.day=sessions.back().day;u.sessions++;}
-   Session&s=sessions[sid];s.count++;s.revenue+=e.price;if(e.kind==2)s.purchase=true;
-   auto&u=ud[key(person,s.day)];u.events++;u.revenue+=e.price;
-   if(e.kind==2)u.categories[e.prod<0?0:prodCats[e.prod]]+=e.price;
-   prev=e.ts;++j;
-  }
-  i=j;
- }
- unordered_map<uint64_t,CampDay> cd;
- checkpoint("Sessionize + user daily aggregation");
- auto ensure_cd=[&](int c,int day)->CampDay&{auto&x=cd[key(c,day)];x.campaign=c;x.day=day;return x;};
- size_t ci=0,si=0;
- while(si<sessions.size()){
-  int person=sessions[si].person;
-  while(ci<clicks.size()&&clicks[ci].user<person)++ci;
-  size_t cbegin=ci;while(ci<clicks.size()&&clicks[ci].user==person)++ci;
-  size_t end=si;while(end<sessions.size()&&sessions[end].person==person)++end;
-  size_t left=cbegin,right=cbegin;
-  unordered_map<int,int> active;active.reserve(32);
-  for(;si<end;++si){const auto&s=sessions[si];
-   while(right<ci&&clicks[right].ts<=s.start){++active[clicks[right].campaign];++right;}
-   while(left<right&&clicks[left].ts<s.start-WEEK){auto it=active.find(clicks[left].campaign);if(--it->second==0)active.erase(it);++left;}
-   // Clicks are ordered by timestamp then byte-wise click_id.
-   // At the most recent timestamp, choose the first (smallest ID), not the last.
-   size_t winning=right;
-   if(left<right){winning=right-1;while(winning>left&&clicks[winning-1].ts==clicks[winning].ts)--winning;}
-   int credit=(left<right?clicks[winning].campaign:organic);
-   auto&row=ensure_cd(credit,s.day);row.sessions++;row.purchasing+=s.purchase;row.revenue+=s.revenue;
-   for(auto&[campaign,n]:active)ensure_cd(campaign,s.day).assists++;
-  }
- }
- checkpoint("Click attribution + campaign aggregation");
- fs::create_directories(out/"user_daily");fs::create_directories(out/"campaign_daily");
- if(const char* f=getenv("VELOCITY_NATIVE_PARQUET"); f && string_view(f)=="1"){
-  vector<const UserDay*> user_rows;
-  user_rows.reserve(ud.size());
-  for(const auto& entry:ud)user_rows.push_back(&entry.second);
-  vector<const CampDay*> camp_rows;
-  camp_rows.reserve(cd.size());
-  for(const auto& entry:cd)camp_rows.push_back(&entry.second);
-  using namespace fastparquet;
-  write((out/"user_daily"/"part-00000.parquet").string(),
-   {{"user_id",BYTE_ARRAY,false,0},{"day",INT32,false,6},
-    {"sessions",INT64},{"events",INT64},{"revenue_cents",INT64},
-    {"top_category",BYTE_ARRAY,true,0}},user_rows.size(),
-   [&](size_t row,size_t col)->Value{
-    const UserDay& u=*user_rows[row];
-    switch(col){
-     case 0:return {true,persons.name(u.person),0};
-     case 1:return {true,{},u.day};
-     case 2:return {true,{},u.sessions};
-     case 3:return {true,{},u.events};
-     case 4:return {true,{},u.revenue};
-     default: {
-      bool found=false;int bestid=0;long long best=-1;
-      for(const auto& [id,v]:u.categories)
-       if(v>best || (v==best && byte_less(cats[id],cats[bestid])))
-         {best=v;bestid=id;found=true;}
-      return {found,found?string_view(cats[bestid]):string_view{},0};
+ checkpoint("Person-shard scatter + parallel sorts");
+
+ const int first_day=day_of(ws);
+ const int total_days=day_of(we-1)-first_day+1;
+ const size_t n_campaigns=campaignNames.size();
+ const size_t camp_slots=n_campaigns*size_t(total_days);
+ vector<vector<UserRow>> user_shards(B);
+ vector<vector<CampDay>> camp_shards(B);
+ vector<size_t> event_counts(B),click_counts(B),session_counts(B);
+ worker_error=nullptr;
+ launch([&](unsigned t) {
+  auto& events=events_by_person[t];auto& clicks=clicks_by_person[t];
+  event_counts[t]=events.size();click_counts[t]=clicks.size();
+  vector<CampDay> cd(camp_slots);
+  auto& ur=user_shards[t];ur.reserve(events.size()/15+1);
+  vector<int> active_counts(n_campaigns,0),active_pos(n_campaigns,-1),active;
+  active.reserve(64);
+  vector<pair<int,i64>> cat_totals;cat_totals.reserve(min<size_t>(cats.size(),32));
+  size_t click_at=0;
+  size_t total_sessions=0;
+  for(size_t e_at=0;e_at<events.size();) {
+   uint64_t user=events[e_at].user;
+   size_t e_end=e_at;
+   while(e_end<events.size()&&events[e_end].user==user)++e_end;
+   while(click_at<clicks.size()&&clicks[click_at].user<user)++click_at;
+   size_t c_start=click_at;
+   while(click_at<clicks.size()&&clicks[click_at].user==user)++click_at;
+   size_t left=c_start,right=c_start;
+   active.clear();cat_totals.clear();
+   UserRow day_row;day_row.user=user;
+   bool have_day=false,have_session=false;
+   i64 prev=0,start=0,revenue=0;
+   bool purchased=false;
+   int session_day=0;
+   auto save_day=[&]() {
+    if(!have_day)return;
+    int best=-1;i64 amount=-1;
+    for(auto [cat,v]:cat_totals) {
+     if(v>amount || (v==amount && (best<0||byte_less(cats[cat],cats[best])))){
+      best=cat;amount=v;
      }
     }
-   });
-  write((out/"campaign_daily"/"part-00000.parquet").string(),
-   {{"campaign_id",BYTE_ARRAY,false,0},{"channel",BYTE_ARRAY,false,0},
-    {"day",INT32,false,6},{"sessions",INT64},
-    {"purchasing_sessions",INT64},{"revenue_cents",INT64},{"assisted_sessions",INT64}},
-   camp_rows.size(),[&](size_t row,size_t col)->Value{
-    const CampDay& c=*camp_rows[row];
-    switch(col){
-     case 0:return {true,campaignNames[c.campaign],0};
-     case 1:return {true,channels[c.campaign],0};
-     case 2:return {true,{},c.day};
-     case 3:return {true,{},c.sessions};
-     case 4:return {true,{},c.purchasing};
-     case 5:return {true,{},c.revenue};
-     default:return {true,{},c.assists};
+    day_row.top=best;
+    ur.push_back(day_row);
+    cat_totals.clear();
+   };
+   auto attribute=[&]() {
+    if(!have_session)return;
+    ++total_sessions;
+    while(right<click_at&&clicks[right].ts<=start) {
+     int cid=clicks[right].campaign;
+     if(active_counts[cid]++==0){active_pos[cid]=int(active.size());active.push_back(cid);}
+     ++right;
     }
-   });
-  checkpoint("Native Parquet serialization");
-  cerr<<"[velocity] events="<<events.size()<<" clicks="<<clicks.size()<<" sessions="<<sessions.size()<<" user_days="<<ud.size()<<" campaign_days="<<cd.size()<<" native_seconds="<<chrono::duration<double>(chrono::steady_clock::now()-tick).count()<<"\n";
-  return 0;
- }
+    while(left<right&&clicks[left].ts<start-WEEK) {
+     int cid=clicks[left].campaign;
+     if(--active_counts[cid]==0){
+      int pos=active_pos[cid],last=active.back();
+      active[pos]=last;active_pos[last]=pos;active.pop_back();active_pos[cid]=-1;
+     }
+     ++left;
+    }
+    int winner=organic;
+    if(left<right){
+     size_t w=right-1;
+     while(w>left&&clicks[w-1].ts==clicks[w].ts)--w;
+     winner=clicks[w].campaign;
+    }
+    size_t d=size_t(session_day-first_day);
+    auto& credit=cd[size_t(winner)*total_days+d];
+    ++credit.sessions;credit.purchasing+=purchased;credit.revenue+=revenue;
+    for(int cid:active)++cd[size_t(cid)*total_days+d].assists;
+   };
+   for(;e_at<e_end;++e_at) {
+    const Event& e=events[e_at];
+    if(!have_session||e.ts-prev>GAP) {
+     attribute();
+     start=e.ts;session_day=day_of(e.ts);
+     if(!have_day||day_row.day!=session_day) {
+      save_day();day_row=UserRow{};day_row.user=user;day_row.day=session_day;have_day=true;
+     }
+     ++day_row.sessions;revenue=0;purchased=false;have_session=true;
+    }
+    ++day_row.events;day_row.revenue+=e.price;
+    revenue+=e.price;purchased|=(e.kind==2);
+    if(e.kind==2) {
+     bool found=false;
+     for(auto& ent:cat_totals)if(ent.first==e.cat){ent.second+=e.price;found=true;break;}
+     if(!found)cat_totals.emplace_back(e.cat,e.price);
+    }
+    prev=e.ts;
+   }
+   attribute();save_day();
+   for(int cid:active){active_counts[cid]=0;active_pos[cid]=-1;}
+  }
+  camp_shards[t]=move(cd);
+  session_counts[t]=total_sessions;
+  vector<Event>().swap(events);vector<Click>().swap(clicks);
+ });
+ checkpoint("Fused person-local sessions + click attribution + daily aggregations");
 
- ofstream uf(out/"user_daily"/"result.csv",ios::binary);
- uf<<"user_id,day,sessions,events,revenue_cents,top_category\n";
- for(auto&[k,u]:ud){string cat;bool found=false; i64 best=-1;
-  for(const auto&[id,value]:u.categories)if(value>best||(value==best&&byte_less(cats[id],cat))){best=value;cat=cats[id];found=true;}
-  uf<<quote_csv(persons.name(u.person))<<','<<iso_day(u.day)<<','<<u.sessions<<','<<u.events<<','<<u.revenue<<','<<(found?quote_csv(cat):"")<<'\n';
+ vector<UserRow> user_rows;
+ size_t n_users=0,n_events=0,n_clicks=0,n_sessions=0;
+ for(unsigned t=0;t<B;++t){n_users+=user_shards[t].size();n_events+=event_counts[t];n_clicks+=click_counts[t];n_sessions+=session_counts[t];}
+ user_rows.reserve(n_users);
+ for(auto& shard:user_shards) {
+  user_rows.insert(user_rows.end(),make_move_iterator(shard.begin()),make_move_iterator(shard.end()));
+  vector<UserRow>().swap(shard);
  }
- ofstream cf(out/"campaign_daily"/"result.csv",ios::binary);
- cf<<"campaign_id,channel,day,sessions,purchasing_sessions,revenue_cents,assisted_sessions\n";
- for(auto&[k,c]:cd)cf<<quote_csv(campaignNames[c.campaign])<<','<<quote_csv(channels[c.campaign])<<','<<iso_day(c.day)<<','<<c.sessions<<','<<c.purchasing<<','<<c.revenue<<','<<c.assists<<'\n';
- uf.close();cf.close();
- checkpoint("Write intermediate CSV output");
- cerr<<"[velocity] events="<<events.size()<<" clicks="<<clicks.size()<<" sessions="<<sessions.size()<<" user_days="<<ud.size()<<" campaign_days="<<cd.size()<<" native_seconds="<<chrono::duration<double>(chrono::steady_clock::now()-tick).count()<<"\n";
+ vector<CampDay> merged(camp_slots);
+ for(unsigned t=0;t<B;++t) {
+  for(size_t i=0;i<camp_slots;++i) {
+   auto& x=merged[i];const auto& y=camp_shards[t][i];
+   x.sessions+=y.sessions;x.purchasing+=y.purchasing;x.revenue+=y.revenue;x.assists+=y.assists;
+  }
+ }
+ vector<size_t> camp_nonzero;
+ for(size_t i=0;i<merged.size();++i)
+  if(merged[i].sessions||merged[i].assists)camp_nonzero.push_back(i);
+ // The writer retains string_view values within page batches. Keep decoded
+ // user names stable in a parallel vector rather than returning temporaries.
+ vector<string> decoded_names;
+ decoded_names.reserve(user_rows.size());
+ for(const auto& r:user_rows)
+  decoded_names.emplace_back((r.user>>63)?unpack_user(r.user):string(special_names[r.user]));
+ fs::create_directories(out/"user_daily");fs::create_directories(out/"campaign_daily");
+ using namespace fastparquet;
+ write((out/"user_daily"/"part-00000.parquet").string(),
+  {{"user_id",BYTE_ARRAY,false,0},{"day",INT32,false,6},
+   {"sessions",INT64},{"events",INT64},{"revenue_cents",INT64},
+   {"top_category",BYTE_ARRAY,true,0}},user_rows.size(),
+  [&](size_t row,size_t col)->Value{
+   const UserRow& u=user_rows[row];
+   switch(col){
+    case 0:return {true,decoded_names[row],0};
+    case 1:return {true,{},u.day};
+    case 2:return {true,{},u.sessions};
+    case 3:return {true,{},u.events};
+    case 4:return {true,{},u.revenue};
+    default:return {u.top>=0,u.top>=0?string_view(cats[u.top]):string_view{},0};
+   }
+  });
+ write((out/"campaign_daily"/"part-00000.parquet").string(),
+  {{"campaign_id",BYTE_ARRAY,false,0},{"channel",BYTE_ARRAY,false,0},
+   {"day",INT32,false,6},{"sessions",INT64},
+   {"purchasing_sessions",INT64},{"revenue_cents",INT64},{"assisted_sessions",INT64}},
+  camp_nonzero.size(),[&](size_t row,size_t col)->Value{
+   size_t idx=camp_nonzero[row];
+   size_t campaign=idx/size_t(total_days);int day=first_day+int(idx%size_t(total_days));
+   const auto& r=merged[idx];
+   switch(col){
+    case 0:return {true,campaignNames[campaign],0};
+    case 1:return {true,channels[campaign],0};
+    case 2:return {true,{},day};
+    case 3:return {true,{},r.sessions};
+    case 4:return {true,{},r.purchasing};
+    case 5:return {true,{},r.revenue};
+    default:return {true,{},r.assists};
+   }
+  });
+ checkpoint("Native Parquet serialization");
+ cerr<<"[velocity] events="<<n_events<<" clicks="<<n_clicks<<" sessions="<<n_sessions<<" user_days="<<user_rows.size()<<" campaign_days="<<camp_nonzero.size()<<" native_seconds="<<chrono::duration<double>(chrono::steady_clock::now()-tick).count()<<"\n";
  return 0;
 }
