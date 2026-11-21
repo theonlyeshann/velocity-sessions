@@ -59,7 +59,10 @@ static bool csv_parse(const string& line, int n, vector<string>& out) {
 }
 // The challenge's CSV has no embedded delimiters or newlines. Parse directly
 // from an mmap'd file; no line or field allocation is needed for event input.
-static bool csv_split7(const char* ptr, size_t len, array<string_view, 7>& out) {
+// Most generated event rows have no quoted fields. One full-row quote check
+// replaces seven separate per-field checks; unusual rows retain the original
+// strict parser and exact malformed-CSV behavior.
+static bool csv_split7_quoted(const char* ptr, size_t len, array<string_view, 7>& out) {
  if(len == 0) return false;
  for(int i = 0; i < 7; ++i) {
   const char* start = ptr;
@@ -81,6 +84,21 @@ static bool csv_split7(const char* ptr, size_t len, array<string_view, 7>& out) 
    len = 0;
   }
  }
+ return true;
+}
+
+static bool csv_split7(const char* ptr, size_t len, array<string_view, 7>& out) {
+ if(len == 0)return false;
+ if(memchr(ptr,'"',len))return csv_split7_quoted(ptr,len,out);
+ for(int i=0;i<6;++i){
+  const char* comma=(const char*)memchr(ptr,',',len);
+  if(!comma)return false;
+  size_t n=size_t(comma-ptr);
+  out[i]=string_view(ptr,n);
+  ptr=comma+1;len-=n+1;
+ }
+ if(memchr(ptr,',',len))return false;
+ out[6]=string_view(ptr,len);
  return true;
 }
 
@@ -836,7 +854,11 @@ int main(int argc,char**argv){
     RowRef row=decode_row(winner);
     array<string_view,7> ff;
     i64 ingest=0;
-    if(csv_split7(row.p,row.n,ff) && parse_ts(ff[3],ingest))build(row,ingest);
+     if(csv_split7(row.p,row.n,ff) && parse_ts(ff[3],ingest)) {
+      // The winner is already parsed: avoid parsing the same CSV a second time.
+      auto record=validate(ff,ingest);
+      if(record.valid)out_events.push_back(record);
+     }
    }
    for(size_t i=t;i<exception_winners.size();i+=workers){
     const auto& row=exception_winners[i];
