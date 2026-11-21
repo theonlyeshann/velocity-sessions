@@ -1,0 +1,24 @@
+# Generated datasets and answers
+dev/
+dev-answer/
+benchmark-output/
+local-output/
+local-scratch/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Rust build artifacts
+generator/target/
+
+# Compiled binaries and backups
+velocity
+*.backup
+*.bak
+*.o
+
+# OS / IDE
+.DS_Store
+.vscode/

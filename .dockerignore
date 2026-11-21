@@ -1,0 +1,6 @@
+.git
+fixtures
+*.zip
+velocity
+benchmarks
+__pycache__
