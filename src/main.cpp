@@ -483,6 +483,15 @@ struct DSU {
 struct Event {i64 ts=0; uint64_t user=0; int32_t price=0; int16_t cat=0; uint8_t kind=0; uint8_t pad=0;};
 static_assert(sizeof(Event)==24);
 struct Click {uint64_t user=0; i64 ts=0; string_view click_id; int campaign=0;};
+// P1: only successful atomic CAS attempts with valid payloads are logged.
+// The atomic winner remains the original ingest/file/offset token, so
+// earliest-ingest ordering and equal-ingest physical tie breaks are unchanged.
+struct DirectEventCandidate {
+ uint64_t token; uint32_t index, raw_user_len;
+ uint64_t user; i64 ts;
+ int32_t price; int16_t cat; uint8_t kind, raw_user;
+};
+static_assert(sizeof(DirectEventCandidate)==40);
 struct UserRow {uint64_t user=0;int day=0,top=-1; i64 sessions=0,events=0,revenue=0;};
 struct CampDay {i64 sessions=0,purchasing=0,revenue=0,assists=0;};
 struct LocalPersonKeys {
@@ -670,7 +679,7 @@ int main(int argc,char**argv){
  for(auto& cell:direct_atomic)cell.store(UINT64_MAX,memory_order_relaxed);
  struct Overflow {uint64_t index;RowRef row;i64 ingest;};
  vector<vector<Overflow>> overflow(workers);
- bool direct_addresses_fit=recovered_key.has_value() && mapped.maps.size()<=256;
+ bool direct_addresses_fit=recovered_key.has_value() && mapped.maps.size()<=256 && max_event_index<=UINT32_MAX;
  if(direct_addresses_fit)for(auto [base,n]:mapped.maps)
   if(n>UINT32_MAX)direct_addresses_fit=false;
  if(!direct_addresses_fit)cerr<<"[velocity] direct atomic winner unsupported input layout; radix/string fallback enabled\n";
@@ -709,6 +718,9 @@ int main(int argc,char**argv){
  };
  // Reader-local shard vectors avoid locks during input scanning.
  vector<vector<vector<RowRef>>> local(workers,vector<vector<RowRef>>(workers));
+ // One write-only record stream per reader, consumed in its original
+ // scan order after the global earliest-ingest winner table is finalized.
+ vector<vector<DirectEventCandidate>> direct_records(workers);
  atomic<size_t> chunk_cursor{0};
  vector<thread> threads;
  mutex error_mutex;
@@ -724,6 +736,8 @@ int main(int argc,char**argv){
  launch([&](unsigned t) {
   auto& shards=local[t];
   auto& unusual=overflow[t];
+  auto& records=direct_records[t];
+  records.reserve(guess_rows/workers + 1024);
   array<string_view,7> f;
   while(true) {
    const size_t idx=chunk_cursor.fetch_add(1,memory_order_relaxed);
@@ -750,7 +764,46 @@ int main(int argc,char**argv){
         if(packed!=UINT64_MAX){
          auto& slot=direct_atomic[index];
          uint64_t old=slot.load(memory_order_relaxed);
-         while(packed<old && !slot.compare_exchange_weak(old,packed,memory_order_relaxed,memory_order_relaxed)){}
+          bool won=false;
+          while(packed<old) {
+           if(slot.compare_exchange_weak(old,packed,memory_order_relaxed,memory_order_relaxed)){
+            won=true;break;
+           }
+          }
+          // Invalid earliest copies still compete in the same atomic CAS.
+          // They deliberately have no payload record, so they suppress later
+          // valid duplicates without producing an output event.
+          if(won && !f[1].empty() && !f[5].empty()){
+           const int k=f[4]=="view"?0:f[4]=="cart"?1:f[4]=="purchase"?2:-1;
+           i64 ts=0,ingest=0;
+           if(k>=0 && parse_ts(f[2],ts) && ts>=ws && ts<we &&
+              parse_ts(f[3],ingest) && ingest-ts<=DAY){
+            int price=0;bool valid=true;
+            if(k==2){
+             if(f[6].empty()) valid=false;
+             else {
+              uint64_t v=0;
+              for(unsigned char c:f[6]){
+               if(c<'0'||c>'9'){valid=false;break;}
+               v=v*10+c-'0';
+               if(v>10000000){valid=false;break;}
+              }
+              if(v<1)valid=false;
+              if(valid)price=int(v);
+             }
+            }
+            if(valid){
+             int cat=0;
+             if(k==2){auto it=productIds.find(f[5]);if(it!=productIds.end())cat=prodCats[it->second];}
+             uint64_t key=0;
+             const bool compact=packed_id(f[1],'u',key);
+             const uint64_t user=compact?key:uint64_t(reinterpret_cast<uintptr_t>(f[1].data()));
+             records.push_back(DirectEventCandidate{
+              packed,uint32_t(index),compact?0U:uint32_t(f[1].size()),
+              user,ts,price,int16_t(cat),uint8_t(k),uint8_t(!compact)});
+            }
+           }
+          }
         } else {
          if(rel>=0)parse_ts(f[3],odd_ingest);
          unusual.push_back({index,{p,len},odd_ingest});
@@ -882,18 +935,19 @@ int main(int argc,char**argv){
   }
   for(auto& [id,rr]:fallback)build(rr.first,rr.second);
   if(direct_addresses_fit) {
-   for(size_t i=t;i<direct_atomic.size();i+=workers) {
-    uint64_t winner=direct_atomic[i].load(memory_order_relaxed);
-    if(winner==UINT64_MAX||winner==0)continue;
-    RowRef row=decode_row(winner);
-    array<string_view,7> ff;
-    i64 ingest=0;
-     if(csv_split7(row.p,row.n,ff) && parse_ts(ff[3],ingest)) {
-      // The winner is already parsed: avoid parsing the same CSV a second time.
-      validate(ff,ingest);
-      // validate() directly appends the compact final Event.
-
-     }
+   // Sequentially read the compact payload log, rather than 19M random
+   // CSV rows. Only final winners survive the exact original-token check.
+   for(const DirectEventCandidate& rec:direct_records[t]) {
+    if(direct_atomic[rec.index].load(memory_order_relaxed)!=rec.token)continue;
+    uint64_t user;
+    if(rec.raw_user){
+     string_view raw(reinterpret_cast<const char*>(uintptr_t(rec.user)),rec.raw_user_len);
+     user=ids.encode(dsu.canonical(raw));
+    }else{
+     uint64_t canonical=dsu.compact_canonical(rec.user);
+     user=canonical==UINT64_MAX?rec.user:(canonical>>63?canonical:ids.encode(dsu.name[size_t(canonical)]));
+    }
+    out_events.push_back(Event{rec.ts,user,rec.price,rec.cat,rec.kind,0});
    }
    for(size_t i=t;i<exception_winners.size();i+=workers){
     const auto& row=exception_winners[i];
