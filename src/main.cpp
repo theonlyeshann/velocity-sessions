@@ -1,6 +1,10 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <atomic>
+#include <thread>
+#include <mutex>
+#include <exception>
 #include <cstring>
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -16,14 +20,16 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
+#include <type_traits>
 #include <vector>
 using namespace std;
 namespace fs=std::filesystem;
 using i64=long long;
 constexpr i64 DAY=86400000LL, WEEK=7*DAY, GAP=1800000LL;
 
-static bool byte_less(const string &a,const string &b) {
+static bool byte_less(string_view a,string_view b) {
  return lexicographical_compare(a.begin(),a.end(),b.begin(),b.end(),[](unsigned char x,unsigned char y){return x<y;});
 }
 static bool csv_parse(const string& line, int n, vector<string>& out) {
@@ -76,33 +82,22 @@ static bool csv_split7(const char* ptr, size_t len, array<string_view, 7>& out) 
  return true;
 }
 
-template<class Fn>
-static void read_event_mmap(const vector<fs::path>& paths, Fn&& fn) {
- array<string_view,7> fields;
- for(const auto& path : paths) {
-  int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
-  if(fd < 0) throw runtime_error("cannot open: " + path.string());
-  struct stat st{};
-  if(fstat(fd, &st) != 0) {close(fd); throw runtime_error("cannot stat input");}
-  if(st.st_size == 0) {close(fd); continue;}
-  auto* base = static_cast<const char*>(mmap(nullptr, size_t(st.st_size), PROT_READ, MAP_PRIVATE, fd, 0));
-  close(fd);
-  if(base == MAP_FAILED) throw runtime_error("mmap failed");
-  const char* p = base;
-  const char* end = base + st.st_size;
-  // Ignore one header line, then read all rows. A CR is data, not a line end.
-  const char* hdr = static_cast<const char*>(memchr(p, '\n', size_t(end - p)));
-  p = hdr ? hdr + 1 : end;
-  while(p < end) {
-   const char* eol = static_cast<const char*>(memchr(p, '\n', size_t(end - p)));
-   const char* stop = eol ? eol : end;
-   if(csv_split7(p, size_t(stop - p), fields)) fn(fields);
-   p = eol ? eol + 1 : end;
-  }
-  munmap(const_cast<char*>(base), size_t(st.st_size));
+static bool csv_split4(const char* ptr,size_t len,array<string_view,4>& out) {
+ if(!len)return false;
+ for(int i=0;i<4;++i) {
+  const char* stop=(const char*)memchr(ptr,',',len);
+  if((i<3 && !stop)||(i==3 && stop))return false;
+  size_t n=stop?size_t(stop-ptr):len;
+  string_view v(ptr,n);
+  if(n>=2 && v.front()=='"' && v.back()=='"') {
+   v.remove_prefix(1);v.remove_suffix(1);
+   if(v.find('"')!=string_view::npos)return false;
+  } else if(v.find('"')!=string_view::npos)return false;
+  out[i]=v;
+  if(stop) {len-=n+1;ptr=stop+1;}
  }
+ return true;
 }
-
 struct TransparentHash {
  using is_transparent=void;
  size_t operator()(string_view s) const noexcept { return hash<string_view>{}(s); }
@@ -112,59 +107,158 @@ struct TransparentEq {
  bool operator()(string_view a,string_view b) const noexcept {return a==b;}
 };
 
-// A cache-friendly open-addressed event-ID index. Exact key comparisons protect
-// correctness even if two different IDs have the same hash.
+// Records are partitioned by the exact normalized event ID, so the earliest
+// ingested copy of an ID always arrives at the same worker, even across files.
+// mmap lifetimes extend until after all processing. No key-string copies.
 class EventIndex {
- struct Slot {uint64_t hash=0;uint64_t key_offset=0;uint32_t key_len=0;uint32_t record=0;};
+ struct Slot {
+  uint64_t hash=0;
+  const char* key=nullptr;
+  uint32_t key_len=0;
+  uint32_t record=0;
+ };
  vector<Slot> slots;
- vector<char> keys;
  size_t mask=0, count=0;
- static uint64_t hashed(string_view id) {
-  uint64_t h=uint64_t(hash<string_view>{}(id));
-  return h ? h : 1;
- }
  void rehash(size_t new_cap) {
   vector<Slot> next(new_cap);
-  const size_t m=new_cap-1;
-  for(const auto& old:slots) if(old.hash) {
+  size_t m=new_cap-1;
+  for(auto const& old:slots) if(old.hash) {
    size_t i=old.hash&m;
    while(next[i].hash) i=(i+1)&m;
    next[i]=old;
   }
-  slots.swap(next);mask=m;
+  slots.swap(next); mask=m;
  }
 public:
  explicit EventIndex(size_t approximate_unique) {
   size_t cap=1024;
   while(cap < approximate_unique + approximate_unique/3 + 64) cap*=2;
   rehash(cap);
-  keys.reserve(approximate_unique*12);
  }
- // Returns the stored record index and whether this was a new ID.
- pair<uint32_t,bool> locate(string_view id, uint32_t index_new) {
-  uint64_t h=hashed(id);
-  size_t pos=h&mask;
-  while(slots[pos].hash) {
-   auto const& s=slots[pos];
+ pair<uint32_t,bool> locate(string_view id, uint32_t new_index) {
+  uint64_t h=uint64_t(hash<string_view>{}(id));
+  if(!h) h=1;
+  size_t i=h&mask;
+  while(slots[i].hash) {
+   auto const& s=slots[i];
    if(s.hash==h && s.key_len==id.size() &&
-      memcmp(keys.data()+s.key_offset, id.data(), id.size())==0)
-    return {s.record,false};
-   pos=(pos+1)&mask;
+      memcmp(s.key,id.data(),id.size())==0) return {s.record,false};
+   i=(i+1)&mask;
   }
   if((count+1)*10 > slots.size()*7) {
    rehash(slots.size()*2);
-   pos=h&mask;
-   while(slots[pos].hash) pos=(pos+1)&mask;
+   i=h&mask;
+   while(slots[i].hash) i=(i+1)&mask;
   }
-  if(id.size()>numeric_limits<uint32_t>::max()) throw runtime_error("event ID too long");
-  slots[pos]=Slot{h,uint64_t(keys.size()),uint32_t(id.size()),index_new};
-  keys.insert(keys.end(),id.begin(),id.end());
+  slots[i]=Slot{h,id.data(),uint32_t(id.size()),new_index};
   ++count;
-  return {index_new,true};
+  return {new_index,true};
  }
- void release() {vector<Slot>().swap(slots);vector<char>().swap(keys);}
 };
 
+// Canonical person names are held by the linked-ID DSU or by still-mapped
+// input rows. Flat indexing avoids allocating a map node and a string for each
+// previously unseen standalone user. Exact comparisons protect collisions.
+class PersonIndex {
+ struct Slot {
+  uint64_t hash=0;
+  const char* ptr=nullptr;
+  uint32_t len=0;
+  uint32_t id=0;
+ };
+ vector<Slot> slots;
+ vector<string_view> names;
+ size_t mask=0,count=0;
+ void rehash(size_t cap) {
+  vector<Slot> fresh(cap);
+  size_t m=cap-1;
+  for(const auto& s:slots)if(s.hash) {
+   size_t i=s.hash&m;
+   while(fresh[i].hash)i=(i+1)&m;
+   fresh[i]=s;
+  }
+  slots.swap(fresh);mask=m;
+ }
+public:
+ PersonIndex() {rehash(1024);}
+ int get(string_view name) {
+  uint64_t h=uint64_t(hash<string_view>{}(name));
+  if(!h)h=1;
+  size_t i=h&mask;
+  while(slots[i].hash) {
+   auto const& x=slots[i];
+   if(x.hash==h && x.len==name.size() &&
+      memcmp(x.ptr,name.data(),name.size())==0)return int(x.id);
+   i=(i+1)&mask;
+  }
+  if((count+1)*10>slots.size()*7) {
+   rehash(slots.size()*2);i=h&mask;
+   while(slots[i].hash)i=(i+1)&mask;
+  }
+  int id=int(names.size());
+  names.push_back(name);
+  slots[i]=Slot{h,name.data(),uint32_t(name.size()),uint32_t(id)};
+  ++count;return id;
+ }
+ string_view name(int id)const{return names[id];}
+ size_t size()const{return names.size();}
+};
+
+// Each row stores only its mmap pointer and length, not seven allocated strings.
+struct RowRef {const char* p; size_t n;};
+struct Chunk {const char* first;const char* last;};
+struct MappedInput {
+ vector<pair<const char*,size_t>> maps;
+ vector<Chunk> chunks;
+ explicit MappedInput(const vector<fs::path>& paths, size_t chunk_bytes=(2U<<20)) {
+  for(auto const& path:paths) {
+   int fd=open(path.c_str(),O_RDONLY|O_CLOEXEC);
+   if(fd<0) throw runtime_error("cannot open "+path.string());
+   struct stat st{};
+   if(fstat(fd,&st)<0) {close(fd);throw runtime_error("cannot stat input");}
+   if(st.st_size==0) {close(fd);continue;}
+   const char* base=(const char*)mmap(nullptr,size_t(st.st_size),PROT_READ,MAP_PRIVATE,fd,0);
+   close(fd);
+   if(base==MAP_FAILED) throw runtime_error("mmap failed");
+   maps.emplace_back(base,size_t(st.st_size));
+   const char* end=base+st.st_size;
+   auto* hdr=(const char*)memchr(base,'\n',size_t(end-base));
+   const char* p=hdr?hdr+1:end;
+   while(p<end) {
+    const char* last=p+min<size_t>(size_t(end-p),chunk_bytes);
+    if(last<end) {
+     const char* nl=(const char*)memchr(last,'\n',size_t(end-last));
+     last=nl?nl+1:end;
+    }
+    chunks.push_back({p,last});p=last;
+   }
+  }
+ }
+ ~MappedInput(){for(auto [p,n]:maps) munmap((void*)p,n);}
+ MappedInput(MappedInput const&)=delete;
+ MappedInput& operator=(MappedInput const&)=delete;
+};
+
+// Minimal first-column normalization, solely for dedup-shard routing.
+// Invalid CSV rows may route anywhere; all are dropped by csv_split7 below.
+static string_view first_field(const char* p,size_t n) {
+ auto* comma=(const char*)memchr(p,',',n);
+ if(!comma) return {};
+ string_view id(p,size_t(comma-p));
+ if(id.size()>=2 && id.front()=='"' && id.back()=='"') {
+  id.remove_prefix(1);id.remove_suffix(1);
+ }
+ return id;
+}
+
+// A record keeps the normalized user ID as a view until all worker threads
+// complete, avoiding shared mutations to the linked-ID union-find structure.
+struct PendingEvent {
+ string_view user;
+ i64 ts=0, ingest=0;
+ int prod=-1,price=0,kind=0;
+ bool valid=false;
+};
 static vector<fs::path> files(const fs::path& folder){
  vector<fs::path> p;
  if(fs::exists(folder))for(const auto &x:fs::directory_iterator(folder))if(x.is_regular_file()&&x.path().extension()==".csv")p.push_back(x.path());
@@ -217,20 +311,27 @@ static bool parse_ts(string_view s,i64 &out){
 }
 static int day_of(i64 ms){i64 x=ms/DAY;if(ms<0&&ms%DAY)--x;return (int)x;}
 static string iso_day(int di){int y;unsigned m,d;from_days(di,y,m,d);char b[20];snprintf(b,sizeof b,"%04d-%02u-%02u",y,m,d);return b;}
-static string quote_csv(const string& s){
- if(s.find_first_of(",\"\r\n")==string::npos)return s;
+static string quote_csv(string_view s){
+ if(s.find_first_of(",\"\r\n")==string::npos)return string(s);
  string r="\"";for(char c:s){if(c=='"')r+='"';r+=c;}return r+'"';
 }
 struct DSU{
- unordered_map<string,int> ids;vector<int> par,sz;vector<string> name;
- int get(const string& s){auto it=ids.find(s);if(it!=ids.end())return it->second;int i=par.size();ids.emplace(s,i);par.push_back(i);sz.push_back(1);name.push_back(s);return i;}
+ unordered_map<string,int,TransparentHash,TransparentEq> ids;vector<int> par,sz;vector<string> name;
+ int get(string_view s){auto it=ids.find(s);if(it!=ids.end())return it->second;int i=par.size();ids.emplace(string(s),i);par.push_back(i);sz.push_back(1);name.emplace_back(s);return i;}
  int root(int i){while(par[i]!=i){par[i]=par[par[i]];i=par[i];}return i;}
  void join(int a,int b){a=root(a);b=root(b);if(a==b)return;if(sz[a]<sz[b])swap(a,b);par[b]=a;sz[a]+=sz[b];if(byte_less(name[b],name[a]))name[a]=name[b];}
+  string_view canonical(string_view id) const {
+   auto it=ids.find(id);
+   if(it==ids.end())return id;
+   int r=it->second;
+   while(par[r]!=r)r=par[r];
+   return name[r];
+  }
 };
 // 32 bytes per winner instead of seven std::strings per raw event.
 // user == -1 marks the earliest copy as invalid; later copies must not rescue it.
 struct Event{i64 ts=0,ingest=0;int user=-1,prod=-1,price=0,kind=0;};
-struct Click{int user,campaign; i64 ts;string click_id;};
+struct Click{int user,campaign; i64 ts;string_view click_id;};
 struct Session{int person,day; i64 start; i64 revenue=0;int count=0;bool purchase=false;};
 struct UserDay{int person,day; i64 sessions=0,events=0,revenue=0;unordered_map<int,i64> categories;};
 struct CampDay{int campaign,day; i64 sessions=0,purchasing=0,revenue=0,assists=0;};
@@ -255,7 +356,8 @@ int main(int argc,char**argv){
  DSU dsu;
  read_files(files(data/"links"),2,[&](const vector<string>&f){if(!f[0].empty()&&!f[1].empty())dsu.join(dsu.get(f[0]),dsu.get(f[1]));});
  checkpoint("Manifest + linked IDs");
- unordered_map<string,int> productIds, campaignIds;
+ unordered_map<string,int,TransparentHash,TransparentEq> productIds;
+ unordered_map<string,int,TransparentHash,TransparentEq> campaignIds;
  vector<string> cats, channels, campaignNames;cats.push_back("unknown");
  unordered_map<string,int> catIds;catIds.emplace("unknown",0);
  vector<int> prodCats;
@@ -263,76 +365,179 @@ int main(int argc,char**argv){
  read_files({data/"campaigns.csv"},2,[&](const vector<string>&f){int id=campaignNames.size();campaignIds.emplace(f[0],id);campaignNames.push_back(f[0]);channels.push_back(f[1]);});
  int organic=campaignNames.size();campaignNames.push_back("organic");channels.push_back("organic");
  checkpoint("Product + campaign lookups");
- // Compact online deduplication: preserve the earliest-ingested copy,
- // including when that copy is invalid. No second raw-event array is kept.
- auto event_paths = files(data/"events");
+ // Two-pass parallel ingestion:
+ // (1) Several readers distribute row pointers by normalized event-ID hash.
+ // (2) One deduplicator per shard performs exact earliest-ingest validation.
+ // This preserves deduplication across files with no global lock or hash table.
+ auto event_paths=files(data/"events");
  uint64_t total_event_bytes=0;
- for(const auto& path:event_paths) total_event_bytes+=fs::file_size(path);
- vector<Event> events;
- events.reserve(size_t(total_event_bytes / 115));
- EventIndex evIndex(size_t(total_event_bytes / 115));
- size_t input_events=0;
- read_event_mmap(event_paths,[&](const array<string_view,7>&f){
-  if(f[0].empty()) return;
-  i64 ingest;
-  if(!parse_ts(f[3],ingest)) return;
-  ++input_events;
-  auto [index,added]=evIndex.locate(f[0],uint32_t(events.size()));
-  if(!added && events[index].ingest<=ingest) return;
-  Event r;
-  r.ingest=ingest;
-  if(!f[1].empty() && !f[5].empty()) {
-   int k=(f[4]=="view"?0:f[4]=="cart"?1:f[4]=="purchase"?2:-1);
-   i64 ts;
-   if(k>=0 && parse_ts(f[2],ts) && ts>=ws && ts<we && ingest-ts<=DAY) {
-    int price=0;
-    bool valid=true;
-    if(k==2) {
-     if(f[6].empty()) valid=false;
-     else {
-      uint64_t v=0;
-      for(unsigned char ch:f[6]) {
-       if(ch<'0' || ch>'9') {valid=false;break;}
-       v=v*10+ch-'0';
-       if(v>10000000) {valid=false;break;}
-      }
-      if(v<1) valid=false;
-      if(valid) price=(int)v;
-     }
+ for(const auto& path:event_paths)total_event_bytes+=fs::file_size(path);
+ const unsigned workers = [&] {
+  int n=8;
+  if(const char* e=getenv("VELOCITY_THREADS")) n=atoi(e);
+  n=clamp(n,1,8);
+  if(total_event_bytes<(8U<<20))n=1;
+  return unsigned(n);
+ }();
+ MappedInput mapped(event_paths);
+ // Reader-local shard vectors avoid locks during input scanning.
+ vector<vector<vector<RowRef>>> local(workers,vector<vector<RowRef>>(workers));
+ atomic<size_t> chunk_cursor{0};
+ vector<thread> threads;
+ mutex error_mutex;
+ exception_ptr worker_error;
+ auto launch=[&](auto work) {
+  threads.clear();
+  for(unsigned t=0;t<workers;++t) threads.emplace_back([&,t] {
+   try {work(t);} catch(...) {lock_guard<mutex> g(error_mutex);if(!worker_error)worker_error=current_exception();}
+  });
+  for(auto& t:threads)t.join();
+  if(worker_error)rethrow_exception(worker_error);
+ };
+ launch([&](unsigned t) {
+  auto& shards=local[t];
+  while(true) {
+   const size_t idx=chunk_cursor.fetch_add(1,memory_order_relaxed);
+   if(idx>=mapped.chunks.size())break;
+   Chunk ch=mapped.chunks[idx];
+   const char* p=ch.first;
+   while(p<ch.last) {
+    const char* nl=(const char*)memchr(p,'\n',size_t(ch.last-p));
+    const char* e=nl?nl:ch.last;
+    string_view id=first_field(p,size_t(e-p));
+    if(!id.empty()) {
+     size_t h=hash<string_view>{}(id);
+     unsigned shard=unsigned((h>>32)%workers);
+     shards[shard].push_back({p,size_t(e-p)});
     }
-    if(valid) {
-     int prod=-1;
-     if(k==2) {
-      // Only purchases need the product's category.
-      auto it=productIds.find(string(f[5]));
-      if(it!=productIds.end()) prod=it->second;
-     }
-     r=Event{ts,ingest,dsu.get(string(f[1])),prod,price,k};
-    }
+    p=nl?nl+1:ch.last;
    }
   }
-  if(added) events.push_back(r);
-  else events[index]=r;
  });
- checkpoint("Parse + dedup + validate events (compact)");
- // Erase invalid winners in-place. Exactly-one-winner-before-validation.
- evIndex.release();
- size_t nvalid=0;
- for(size_t i=0;i<events.size();++i) if(events[i].user>=0) events[nvalid++]=events[i];
- events.resize(nvalid);
- checkpoint("Compact valid events");
- vector<Click> clicks; clicks.reserve(250000);unordered_map<string,bool> seen;
- read_files(files(data/"clicks"),4,[&](const vector<string>&f){
-  if(f[0].empty()||!seen.emplace(f[0],true).second)return;
-  if(f[1].empty())return;i64 ts;if(!parse_ts(f[3],ts)||ts<ws-WEEK||ts>=we)return;
-  auto ci=campaignIds.find(f[2]);if(ci==campaignIds.end())return;
-  clicks.push_back({dsu.get(f[1]),ci->second,ts,f[0]});
+ checkpoint("Parallel scan + partition event rows");
+ vector<vector<PendingEvent>> results(workers);
+ vector<size_t> winning(workers,0);
+ worker_error=nullptr;
+ launch([&](unsigned t) {
+  size_t count=0;
+  for(unsigned r=0;r<workers;++r)count+=local[r][t].size();
+  auto& out_events=results[t];
+  out_events.reserve(count);
+  EventIndex index(count);
+  array<string_view,7> f;
+  for(unsigned r=0;r<workers;++r) {
+   for(RowRef row:local[r][t]) {
+    if(!csv_split7(row.p,row.n,f) || f[0].empty())continue;
+    i64 ingest;
+    if(!parse_ts(f[3],ingest))continue;
+    auto [i,added]=index.locate(f[0],uint32_t(out_events.size()));
+    if(!added && out_events[i].ingest<=ingest)continue;
+    PendingEvent record;
+    record.ingest=ingest;
+    if(!f[1].empty() && !f[5].empty()) {
+     int k=(f[4]=="view"?0:f[4]=="cart"?1:f[4]=="purchase"?2:-1);
+     i64 ts;
+     if(k>=0 && parse_ts(f[2],ts) && ts>=ws && ts<we && ingest-ts<=DAY) {
+      int price=0;
+      bool valid=true;
+      if(k==2) {
+       if(f[6].empty()) valid=false;
+       else {
+        uint64_t v=0;
+        for(unsigned char ch:f[6]) {
+         if(ch<'0'||ch>'9') {valid=false;break;}
+         v=v*10+ch-'0';
+         if(v>10000000) {valid=false;break;}
+        }
+        if(v<1)valid=false;
+        if(valid)price=(int)v;
+       }
+      }
+      if(valid) {
+       int prod=-1;
+       if(k==2) {
+        auto it=productIds.find(f[5]);
+        if(it!=productIds.end())prod=it->second;
+       }
+       record=PendingEvent{f[1],ts,ingest,prod,price,k,true};
+      }
+     }
+    }
+    if(added)out_events.push_back(record);
+    else out_events[i]=record;
+   }
+   vector<RowRef>().swap(local[r][t]);
+  }
+  size_t nvalid=0;
+  for(size_t i=0;i<out_events.size();++i)
+   if(out_events[i].valid)out_events[nvalid++]=out_events[i];
+  out_events.resize(nvalid);
+  winning[t]=nvalid;
  });
+ checkpoint("Parallel exact dedup + event validation");
+ vector<vector<vector<RowRef>>>().swap(local);
+ PersonIndex persons;
+ vector<Event> events;
+ size_t total_valid=0;
+ for(size_t n:winning)total_valid+=n;
+ events.reserve(total_valid);
+ for(auto& part:results) {
+  for(auto const& r:part)
+   events.push_back(Event{r.ts,r.ingest,persons.get(dsu.canonical(r.user)),r.prod,r.price,r.kind});
+  vector<PendingEvent>().swap(part);
+ }
+ checkpoint("Resolve deduplicated user IDs");
+ MappedInput mapped_clicks(files(data/"clicks"));
+ vector<Click> clicks;
+ unordered_set<string_view,TransparentHash,TransparentEq> seen;
+ array<string_view,4> f;
+ for(const auto& chunk:mapped_clicks.chunks) {
+  const char* p=chunk.first;
+  while(p<chunk.last) {
+   const char* nl=(const char*)memchr(p,'\n',size_t(chunk.last-p));
+   const char* end=nl?nl:chunk.last;
+   if(csv_split4(p,size_t(end-p),f) && !f[0].empty() && seen.emplace(f[0]).second) {
+    if(!f[1].empty()) {
+     i64 ts;
+     if(parse_ts(f[3],ts) && ts>=ws-WEEK && ts<we) {
+      auto ci=campaignIds.find(f[2]);
+      if(ci!=campaignIds.end())clicks.push_back({persons.get(dsu.canonical(f[1])),ci->second,ts,f[0]});
+     }
+    }
+   }
+   p=nl?nl+1:chunk.last;
+  }
+ }
  checkpoint("Read + validate clicks");
- for(auto& e:events)e.user=dsu.root(e.user);
- for(auto& c:clicks)c.user=dsu.root(c.user);
- sort(events.begin(),events.end(),[](const Event&a,const Event&b){if(a.user!=b.user)return a.user<b.user;return a.ts<b.ts;});
- sort(clicks.begin(),clicks.end(),[](const Click&a,const Click&b){if(a.user!=b.user)return a.user<b.user;if(a.ts!=b.ts)return a.ts<b.ts;return byte_less(a.click_id,b.click_id);});
+ auto sort_by_person=[&](auto& records,auto less) {
+  if(workers<2 || records.size()<150000) {
+   sort(records.begin(),records.end(),less);return;
+  }
+  using Record=typename decay_t<decltype(records)>::value_type;
+  size_t num_persons=persons.size();
+  vector<size_t> count(workers,0),offset(workers+1,0),next(workers);
+  auto bucket=[&](int person)->size_t {
+   return (uint64_t(uint32_t(person))*workers)/num_persons;
+  };
+  for(const auto& r:records)++count[bucket(r.user)];
+  for(unsigned t=0;t<workers;++t)offset[t+1]=offset[t]+count[t];
+  for(unsigned t=0;t<workers;++t)next[t]=offset[t];
+  vector<Record> shuffled(records.size());
+  for(auto& r:records)shuffled[next[bucket(r.user)]++]=move(r);
+  records.swap(shuffled);
+  worker_error=nullptr;
+  launch([&](unsigned t) {
+   sort(records.begin()+offset[t],records.begin()+offset[t+1],less);
+  });
+ };
+ sort_by_person(events,[](const Event&a,const Event&b){
+  return a.user==b.user?a.ts<b.ts:a.user<b.user;
+ });
+ sort_by_person(clicks,[](const Click&a,const Click&b){
+  if(a.user!=b.user)return a.user<b.user;
+  if(a.ts!=b.ts)return a.ts<b.ts;
+  return byte_less(a.click_id,b.click_id);
+ });
  vector<Session> sessions;sessions.reserve(events.size()/3+1);
  checkpoint("Resolve roots + sort events/clicks");
  unordered_map<uint64_t,UserDay> ud;
@@ -375,7 +580,7 @@ int main(int argc,char**argv){
  uf<<"user_id,day,sessions,events,revenue_cents,top_category\n";
  for(auto&[k,u]:ud){string cat;bool found=false; i64 best=-1;
   for(const auto&[id,value]:u.categories)if(value>best||(value==best&&byte_less(cats[id],cat))){best=value;cat=cats[id];found=true;}
-  uf<<quote_csv(dsu.name[u.person])<<','<<iso_day(u.day)<<','<<u.sessions<<','<<u.events<<','<<u.revenue<<','<<(found?quote_csv(cat):"")<<'\n';
+  uf<<quote_csv(persons.name(u.person))<<','<<iso_day(u.day)<<','<<u.sessions<<','<<u.events<<','<<u.revenue<<','<<(found?quote_csv(cat):"")<<'\n';
  }
  ofstream cf(out/"campaign_daily"/"result.csv",ios::binary);
  cf<<"campaign_id,channel,day,sessions,purchasing_sessions,revenue_cents,assisted_sessions\n";
