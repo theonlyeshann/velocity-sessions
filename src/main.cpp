@@ -1,6 +1,11 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstring>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
@@ -44,44 +49,57 @@ static bool csv_parse(const string& line, int n, vector<string>& out) {
  }
  return (int)out.size()==n;
 }
-// Zero-allocation field parsing. Views remain valid only while the current line lives.
-static bool csv_parse_views(const string& line, int n, vector<string_view>& out) {
- out.clear();
- if(line.empty()) return false;
- size_t i=0, len=line.size();
- while(true) {
-  string_view field;
-  if(i<len && line[i]=='"') {
-   ++i; size_t start=i;
-   while(i<len && line[i]!='"') ++i;
-   if(i==len) return false;
-   field=string_view(line.data()+start,i-start);
-   ++i;
-   if(i<len && line[i]!=',') return false;
+// The challenge's CSV has no embedded delimiters or newlines. Parse directly
+// from an mmap'd file; no line or field allocation is needed for event input.
+static bool csv_split7(const char* ptr, size_t len, array<string_view, 7>& out) {
+ if(len == 0) return false;
+ for(int i = 0; i < 7; ++i) {
+  const char* start = ptr;
+  const char* stop = (const char*)memchr(ptr, ',', len);
+  if(i != 6 && stop == nullptr) return false;
+  if(i == 6 && stop != nullptr) return false;
+  const size_t n = stop ? size_t(stop - start) : len;
+  string_view field(start, n);
+  if(n >= 2 && field.front() == '"' && field.back() == '"') {
+   field.remove_prefix(1); field.remove_suffix(1);
+   if(field.find('"') != string_view::npos) return false;
+  } else if(field.find('"') != string_view::npos) return false;
+  out[i] = field;
+  if(stop) {
+   len -= n + 1;
+   ptr = stop + 1;
   } else {
-   size_t start=i;
-   while(i<len && line[i]!=',') {
-    if(line[i]=='"') return false;
-    ++i;
-   }
-   field=string_view(line.data()+start,i-start);
+   ptr += len;
+   len = 0;
   }
-  out.push_back(field);
-  if(i==len) break;
-  ++i;
-  if(i==len) {out.emplace_back();break;}
  }
- return (int)out.size()==n;
+ return true;
 }
 
-template<class Fn>static void read_event_views(const vector<fs::path>& paths, Fn fn) {
- vector<string_view> fields;
- fields.reserve(7);
- for(const auto& path:paths) {
-  ifstream in(path,ios::binary);
-  string line;
-  getline(in,line);
-  while(getline(in,line)) if(csv_parse_views(line,7,fields)) fn(fields);
+template<class Fn>
+static void read_event_mmap(const vector<fs::path>& paths, Fn&& fn) {
+ array<string_view,7> fields;
+ for(const auto& path : paths) {
+  int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if(fd < 0) throw runtime_error("cannot open: " + path.string());
+  struct stat st{};
+  if(fstat(fd, &st) != 0) {close(fd); throw runtime_error("cannot stat input");}
+  if(st.st_size == 0) {close(fd); continue;}
+  auto* base = static_cast<const char*>(mmap(nullptr, size_t(st.st_size), PROT_READ, MAP_PRIVATE, fd, 0));
+  close(fd);
+  if(base == MAP_FAILED) throw runtime_error("mmap failed");
+  const char* p = base;
+  const char* end = base + st.st_size;
+  // Ignore one header line, then read all rows. A CR is data, not a line end.
+  const char* hdr = static_cast<const char*>(memchr(p, '\n', size_t(end - p)));
+  p = hdr ? hdr + 1 : end;
+  while(p < end) {
+   const char* eol = static_cast<const char*>(memchr(p, '\n', size_t(end - p)));
+   const char* stop = eol ? eol : end;
+   if(csv_split7(p, size_t(stop - p), fields)) fn(fields);
+   p = eol ? eol + 1 : end;
+  }
+  munmap(const_cast<char*>(base), size_t(st.st_size));
  }
 }
 
@@ -92,6 +110,59 @@ struct TransparentHash {
 struct TransparentEq {
  using is_transparent=void;
  bool operator()(string_view a,string_view b) const noexcept {return a==b;}
+};
+
+// A cache-friendly open-addressed event-ID index. Exact key comparisons protect
+// correctness even if two different IDs have the same hash.
+class EventIndex {
+ struct Slot {uint64_t hash=0;uint64_t key_offset=0;uint32_t key_len=0;uint32_t record=0;};
+ vector<Slot> slots;
+ vector<char> keys;
+ size_t mask=0, count=0;
+ static uint64_t hashed(string_view id) {
+  uint64_t h=uint64_t(hash<string_view>{}(id));
+  return h ? h : 1;
+ }
+ void rehash(size_t new_cap) {
+  vector<Slot> next(new_cap);
+  const size_t m=new_cap-1;
+  for(const auto& old:slots) if(old.hash) {
+   size_t i=old.hash&m;
+   while(next[i].hash) i=(i+1)&m;
+   next[i]=old;
+  }
+  slots.swap(next);mask=m;
+ }
+public:
+ explicit EventIndex(size_t approximate_unique) {
+  size_t cap=1024;
+  while(cap < approximate_unique + approximate_unique/3 + 64) cap*=2;
+  rehash(cap);
+  keys.reserve(approximate_unique*12);
+ }
+ // Returns the stored record index and whether this was a new ID.
+ pair<uint32_t,bool> locate(string_view id, uint32_t index_new) {
+  uint64_t h=hashed(id);
+  size_t pos=h&mask;
+  while(slots[pos].hash) {
+   auto const& s=slots[pos];
+   if(s.hash==h && s.key_len==id.size() &&
+      memcmp(keys.data()+s.key_offset, id.data(), id.size())==0)
+    return {s.record,false};
+   pos=(pos+1)&mask;
+  }
+  if((count+1)*10 > slots.size()*7) {
+   rehash(slots.size()*2);
+   pos=h&mask;
+   while(slots[pos].hash) pos=(pos+1)&mask;
+  }
+  if(id.size()>numeric_limits<uint32_t>::max()) throw runtime_error("event ID too long");
+  slots[pos]=Slot{h,uint64_t(keys.size()),uint32_t(id.size()),index_new};
+  keys.insert(keys.end(),id.begin(),id.end());
+  ++count;
+  return {index_new,true};
+ }
+ void release() {vector<Slot>().swap(slots);vector<char>().swap(keys);}
 };
 
 static vector<fs::path> files(const fs::path& folder){
@@ -156,7 +227,9 @@ struct DSU{
  int root(int i){while(par[i]!=i){par[i]=par[par[i]];i=par[i];}return i;}
  void join(int a,int b){a=root(a);b=root(b);if(a==b)return;if(sz[a]<sz[b])swap(a,b);par[b]=a;sz[a]+=sz[b];if(byte_less(name[b],name[a]))name[a]=name[b];}
 };
-struct Event{int user,prod,price=0; i64 ts,ingest;int kind;};
+// 32 bytes per winner instead of seven std::strings per raw event.
+// user == -1 marks the earliest copy as invalid; later copies must not rescue it.
+struct Event{i64 ts=0,ingest=0;int user=-1,prod=-1,price=0,kind=0;};
 struct Click{int user,campaign; i64 ts;string click_id;};
 struct Session{int person,day; i64 start; i64 revenue=0;int count=0;bool purchase=false;};
 struct UserDay{int person,day; i64 sessions=0,events=0,revenue=0;unordered_map<int,i64> categories;};
@@ -190,29 +263,64 @@ int main(int argc,char**argv){
  read_files({data/"campaigns.csv"},2,[&](const vector<string>&f){int id=campaignNames.size();campaignIds.emplace(f[0],id);campaignNames.push_back(f[0]);channels.push_back(f[1]);});
  int organic=campaignNames.size();campaignNames.push_back("organic");channels.push_back("organic");
  checkpoint("Product + campaign lookups");
- vector<Event> events;events.reserve(1000000);
- unordered_map<string,size_t,TransparentHash,TransparentEq> evIndex;
- // Keep raw winners to preserve the exact dedup-before-validation semantics.
- struct RawEvent{array<string,7> f;i64 ingest;};
- vector<RawEvent> raw;raw.reserve(1000000);evIndex.reserve(1200000);
- read_event_views(files(data/"events"),[&](const vector<string_view>&f){
-  if(f[0].empty())return; i64 ingest;if(!parse_ts(f[3],ingest))return;
-  auto pos=evIndex.find(f[0]);if(pos!=evIndex.end()&&raw[pos->second].ingest<=ingest)return;
-  RawEvent r;for(int j=0;j<7;j++)r.f[j].assign(f[j].data(),f[j].size());r.ingest=ingest;
-  if(pos==evIndex.end()){evIndex.emplace(string(f[0]),raw.size());raw.push_back(move(r));}else raw[pos->second]=move(r);
+ // Compact online deduplication: preserve the earliest-ingested copy,
+ // including when that copy is invalid. No second raw-event array is kept.
+ auto event_paths = files(data/"events");
+ uint64_t total_event_bytes=0;
+ for(const auto& path:event_paths) total_event_bytes+=fs::file_size(path);
+ vector<Event> events;
+ events.reserve(size_t(total_event_bytes / 115));
+ EventIndex evIndex(size_t(total_event_bytes / 115));
+ size_t input_events=0;
+ read_event_mmap(event_paths,[&](const array<string_view,7>&f){
+  if(f[0].empty()) return;
+  i64 ingest;
+  if(!parse_ts(f[3],ingest)) return;
+  ++input_events;
+  auto [index,added]=evIndex.locate(f[0],uint32_t(events.size()));
+  if(!added && events[index].ingest<=ingest) return;
+  Event r;
+  r.ingest=ingest;
+  if(!f[1].empty() && !f[5].empty()) {
+   int k=(f[4]=="view"?0:f[4]=="cart"?1:f[4]=="purchase"?2:-1);
+   i64 ts;
+   if(k>=0 && parse_ts(f[2],ts) && ts>=ws && ts<we && ingest-ts<=DAY) {
+    int price=0;
+    bool valid=true;
+    if(k==2) {
+     if(f[6].empty()) valid=false;
+     else {
+      uint64_t v=0;
+      for(unsigned char ch:f[6]) {
+       if(ch<'0' || ch>'9') {valid=false;break;}
+       v=v*10+ch-'0';
+       if(v>10000000) {valid=false;break;}
+      }
+      if(v<1) valid=false;
+      if(valid) price=(int)v;
+     }
+    }
+    if(valid) {
+     int prod=-1;
+     if(k==2) {
+      // Only purchases need the product's category.
+      auto it=productIds.find(string(f[5]));
+      if(it!=productIds.end()) prod=it->second;
+     }
+     r=Event{ts,ingest,dsu.get(string(f[1])),prod,price,k};
+    }
+   }
+  }
+  if(added) events.push_back(r);
+  else events[index]=r;
  });
- evIndex.clear();events.clear();
- checkpoint("Read + deduplicate raw events");
- for(auto&r:raw){auto&f=r.f;
-  if(f[1].empty()||f[5].empty())continue;
-  int k=(f[4]=="view"?0:f[4]=="cart"?1:f[4]=="purchase"?2:-1);if(k<0)continue;
-  i64 ts;if(!parse_ts(f[2],ts)||ts<ws||ts>=we||r.ingest-ts>DAY)continue;
-  int price=0;if(k==2){if(f[6].empty())continue;uint64_t v=0;bool ok=true;for(unsigned char ch:f[6]){if(ch<'0'||ch>'9'){ok=false;break;}v=v*10+ch-'0';if(v>10000000){ok=false;break;}}if(!ok||v<1)continue;price=(int)v;}
-  int prod=-1;auto pit=productIds.find(f[5]);if(pit!=productIds.end())prod=pit->second;
-  events.push_back({dsu.get(f[1]),prod,price,ts,r.ingest,k});
- }
- raw.clear();
- checkpoint("Validate events + resolve user IDs");
+ checkpoint("Parse + dedup + validate events (compact)");
+ // Erase invalid winners in-place. Exactly-one-winner-before-validation.
+ evIndex.release();
+ size_t nvalid=0;
+ for(size_t i=0;i<events.size();++i) if(events[i].user>=0) events[nvalid++]=events[i];
+ events.resize(nvalid);
+ checkpoint("Compact valid events");
  vector<Click> clicks; clicks.reserve(250000);unordered_map<string,bool> seen;
  read_files(files(data/"clicks"),4,[&](const vector<string>&f){
   if(f[0].empty()||!seen.emplace(f[0],true).second)return;
