@@ -100,6 +100,24 @@ static bool csv_split4(const char* ptr,size_t len,array<string_view,4>& out) {
  }
  return true;
 }
+// Exact two-field CSV parser over an mmap'd row. Never copies link strings.
+// The same no-embedded-delimiter dialect is used by the other row parsers.
+static bool csv_split2(const char* ptr, size_t len, array<string_view,2>& out) {
+ if(len==0)return false;
+ for(int i=0;i<2;++i){
+  const char* stop=(const char*)memchr(ptr,',',len);
+  if((i==0 && !stop)||(i==1 && stop))return false;
+  size_t n=stop?size_t(stop-ptr):len;
+  string_view v(ptr,n);
+  if(n>=2 && v.front()=='"' && v.back()=='"'){
+   v.remove_prefix(1);v.remove_suffix(1);
+   if(v.find('"')!=string_view::npos)return false;
+  }else if(v.find('"')!=string_view::npos)return false;
+  out[i]=v;
+  if(stop){len-=n+1;ptr=stop+1;}
+ }
+ return true;
+}
 struct TransparentHash {
  using is_transparent=void;
  size_t operator()(string_view s) const noexcept { return hash<string_view>{}(s); }
@@ -344,29 +362,73 @@ static string quote_csv(string_view s){
  if(s.find_first_of(",\"\r\n")==string::npos)return string(s);
  string r="\"";for(char c:s){if(c=='"')r+='"';r+=c;}return r+'"';
 }
+// V8: Dense, flat linked-identity index. Backing mmap lifetime outlives DSU.
+// Ordinary packed user IDs do not allocate individual hash nodes or strings.
+// Unusual IDs are retained as exact byte-string views (never normalized).
 struct DSU {
- unordered_map<uint64_t,int> packed;
- unordered_map<string,int,TransparentHash,TransparentEq> other;
+ struct Slot {uint64_t key=0;uint32_t index=0;uint32_t pad=0;};
+ vector<Slot> slots;
+ size_t mask=0,used=0;
+ unordered_map<string_view,int,TransparentHash,TransparentEq> other;
  vector<int> par,sz;
- vector<string> name;
+ vector<string_view> name;
+ explicit DSU(size_t estimated_links=0) {
+  size_t cap=1024;
+  // IDs per link are at most 2. Avoid excessive initial allocations.
+  size_t want=min<size_t>(estimated_links*2+1024,1UL<<26);
+  while(cap<want && cap<(1UL<<26))cap*=2;
+  slots.resize(cap);mask=cap-1;
+  size_t reserve_nodes=min<size_t>(estimated_links*2+1024,1UL<<26);
+  par.reserve(reserve_nodes);sz.reserve(reserve_nodes);name.reserve(reserve_nodes);
+ }
+ void grow(){
+  vector<Slot> next(slots.size()*2);
+  const size_t m=next.size()-1;
+  for(const Slot& s:slots)if(s.key){
+   size_t j=mix64(s.key)&m;
+   while(next[j].key)j=(j+1)&m;
+   next[j]=s;
+  }
+  slots.swap(next);mask=m;
+ }
  int lookup(string_view s)const {
   uint64_t key;
-  if(packed_id(s,'u',key)) {
-   auto it=packed.find(key);return it==packed.end()?-1:it->second;
+  if(packed_id(s,'u',key)){
+   size_t i=mix64(key)&mask;
+   while(slots[i].key){
+    if(slots[i].key==key)return int(slots[i].index);
+    i=(i+1)&mask;
+   }
+   return -1;
   }
   auto it=other.find(s);return it==other.end()?-1:it->second;
  }
- int get(string_view s) {
-  int old=lookup(s);if(old>=0)return old;
-  int i=int(par.size());
+ int get(string_view s){
   uint64_t key;
-  if(packed_id(s,'u',key))packed.emplace(key,i);
-  else other.emplace(string(s),i);
-  par.push_back(i);sz.push_back(1);name.emplace_back(s);
+  const bool is_packed=packed_id(s,'u',key);
+  size_t at=0;
+  if(is_packed){
+   at=mix64(key)&mask;
+   while(slots[at].key){
+    if(slots[at].key==key)return int(slots[at].index);
+    at=(at+1)&mask;
+   }
+   if((used+1)*4>=slots.size()*3){
+    grow();at=mix64(key)&mask;
+    while(slots[at].key)at=(at+1)&mask;
+   }
+  }else{
+   auto it=other.find(s);
+   if(it!=other.end())return it->second;
+  }
+  int i=int(par.size());
+  par.push_back(i);sz.push_back(1);name.push_back(s);
+  if(is_packed){slots[at]=Slot{key,uint32_t(i),0};++used;}
+  else other.emplace(s,i);
   return i;
  }
- int root(int i) {while(par[i]!=i){par[i]=par[par[i]];i=par[i];}return i;}
- void join(int a,int b) {
+ int root(int i){while(par[i]!=i){par[i]=par[par[i]];i=par[i];}return i;}
+ void join(int a,int b){
   a=root(a);b=root(b);if(a==b)return;
   if(sz[a]<sz[b])swap(a,b);
   par[b]=a;sz[a]+=sz[b];
@@ -470,8 +532,26 @@ int main(int argc,char**argv){
   size_t p=manifest.find('"'+field+'"');if(p==string::npos)throw runtime_error("missing manifest field");p=manifest.find(':',p);p=manifest.find('"',p);auto e=manifest.find('"',p+1);return manifest.substr(p+1,e-p-1);
  };
  i64 ws,we;if(!parse_ts(get_manifest("window_start"),ws)||!parse_ts(get_manifest("window_end"),we))throw runtime_error("bad manifest");
- DSU dsu;
- read_files(files(data/"links"),2,[&](const vector<string>&f){if(!f[0].empty()&&!f[1].empty())dsu.join(dsu.get(f[0]),dsu.get(f[1]));});
+ // Keep links mapped through all event/click processing: canonical() returns
+ // exact string views into link records, including unused/minimum aliases.
+ const auto link_paths=files(data/"links");
+ size_t link_bytes=0;
+ for(const auto& path:link_paths)link_bytes+=fs::file_size(path);
+ // Only a capacity hint; correctness never depends on rows' length or count.
+ DSU dsu(link_bytes/32);
+ MappedInput mapped_links(link_paths);
+ array<string_view,2> link_fields;
+ for(const Chunk& chunk:mapped_links.chunks){
+  const char* p=chunk.first;
+  while(p<chunk.last){
+   const char* nl=(const char*)memchr(p,'\n',size_t(chunk.last-p));
+   const char* end=nl?nl:chunk.last;
+   if(csv_split2(p,size_t(end-p),link_fields) &&
+      !link_fields[0].empty() && !link_fields[1].empty())
+    dsu.join(dsu.get(link_fields[0]),dsu.get(link_fields[1]));
+   p=nl?nl+1:chunk.last;
+  }
+ }
  checkpoint("Manifest + linked IDs");
  unordered_map<string,int,TransparentHash,TransparentEq> productIds;
  unordered_map<string,int,TransparentHash,TransparentEq> campaignIds;
