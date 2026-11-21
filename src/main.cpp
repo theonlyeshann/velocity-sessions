@@ -384,7 +384,7 @@ static string quote_csv(string_view s){
 // Ordinary packed user IDs do not allocate individual hash nodes or strings.
 // Unusual IDs are retained as exact byte-string views (never normalized).
 struct DSU {
- struct Slot {uint64_t key=0;uint32_t index=0;uint32_t pad=0;};
+ struct Slot {uint64_t key=0;uint64_t value=0;};
  vector<Slot> slots;
  size_t mask=0,used=0;
  unordered_map<string_view,int,TransparentHash,TransparentEq> other;
@@ -414,7 +414,7 @@ struct DSU {
   if(packed_id(s,'u',key)){
    size_t i=mix64(key)&mask;
    while(slots[i].key){
-    if(slots[i].key==key)return int(slots[i].index);
+    if(slots[i].key==key)return int(slots[i].value);
     i=(i+1)&mask;
    }
    return -1;
@@ -428,7 +428,7 @@ struct DSU {
   if(is_packed){
    at=mix64(key)&mask;
    while(slots[at].key){
-    if(slots[at].key==key)return int(slots[at].index);
+    if(slots[at].key==key)return int(slots[at].value);
     at=(at+1)&mask;
    }
    if((used+1)*4>=slots.size()*3){
@@ -441,7 +441,7 @@ struct DSU {
   }
   int i=int(par.size());
   par.push_back(i);sz.push_back(1);name.push_back(s);
-  if(is_packed){slots[at]=Slot{key,uint32_t(i),0};++used;}
+  if(is_packed){slots[at]=Slot{key,uint64_t(i)};++used;}
   else other.emplace(s,i);
   return i;
  }
@@ -451,6 +451,25 @@ struct DSU {
   if(sz[a]<sz[b])swap(a,b);
   par[b]=a;sz[a]+=sz[b];
   if(byte_less(name[b],name[a]))name[a]=name[b];
+ }
+ // Called exactly once after reading all link CSV files. The hash table is
+ // never mutated afterwards; its 64-bit payload now holds the canonical
+ // compact ID (high bit set) or a root index for non-compact names.
+ void finalize() {
+  for(Slot& slot:slots)if(slot.key){
+   int r=root(int(slot.value));
+   uint64_t packed;
+   if(packed_id(name[r],'u',packed)) slot.value=packed;
+   else slot.value=uint64_t(r);
+  }
+ }
+ uint64_t compact_canonical(uint64_t key) const {
+  size_t at=mix64(key)&mask;
+  while(slots[at].key){
+   if(slots[at].key==key)return slots[at].value;
+   at=(at+1)&mask;
+  }
+  return UINT64_MAX;
  }
  string_view canonical(string_view id)const {
   int r=lookup(id);if(r<0)return id;
@@ -480,6 +499,19 @@ struct LocalPersonKeys {
   return local;
  }
 };
+// Directly reuse finalized DSU canonical encodings for ordinary generated
+// identifiers. This avoids a second base36 parse, a parent chase, and a
+// second random-memory lookup for every event and click.
+static uint64_t encode_canonical_user(const DSU& dsu, string_view raw, LocalPersonKeys& ids){
+ uint64_t packed;
+ if(packed_id(raw,'u',packed)){
+  uint64_t canonical=dsu.compact_canonical(packed);
+  if(canonical==UINT64_MAX)return packed; // unlinked ID
+  if(canonical>>63)return canonical;       // linked, compact canonical ID
+  return ids.encode(dsu.name[size_t(canonical)]); // noncompact minimum
+ }
+ return ids.encode(dsu.canonical(raw));
+}
 static string unpack_user(uint64_t key) {
  static constexpr char digits[]="0123456789abcdefghijklmnopqrstuvwxyz";
  const size_t n=size_t(key&255);
@@ -570,6 +602,7 @@ int main(int argc,char**argv){
    p=nl?nl+1:chunk.last;
   }
  }
+ dsu.finalize();
  checkpoint("Manifest + linked IDs");
  unordered_map<string,int,TransparentHash,TransparentEq> productIds;
  unordered_map<string,int,TransparentHash,TransparentEq> campaignIds;
@@ -773,19 +806,19 @@ int main(int argc,char**argv){
    v.swap(temp);
   }
  };
- vector<vector<PendingEvent>> results(workers);
- vector<size_t> winning(workers,0);
+ vector<LocalPersonKeys> local_names(workers);
+ vector<vector<Event>> event_parts(workers);
  worker_error=nullptr;
  launch([&](unsigned t) {
   size_t count=0;
   for(unsigned r=0;r<workers;++r)count+=local[r][t].size();
-  auto& out_events=results[t];
-  out_events.reserve(count);
+  auto& out_events=event_parts[t];
+  auto& ids=local_names[t];
+  out_events.reserve(count + (direct_addresses_fit ? max_event_index/workers : 0));
   vector<PackedRaw> candidates;candidates.reserve(count);
   unordered_map<string_view,pair<RowRef,i64>,TransparentHash,TransparentEq> fallback;
   array<string_view,7> f;
-  auto validate=[&](const array<string_view,7>& ff,i64 ingest)->PendingEvent {
-   PendingEvent record;record.ingest=ingest;
+  auto validate=[&](const array<string_view,7>& ff,i64 ingest) {
    if(!ff[1].empty() && !ff[5].empty()) {
     int k=(ff[4]=="view"?0:ff[4]=="cart"?1:ff[4]=="purchase"?2:-1);
     i64 ts;
@@ -810,11 +843,11 @@ int main(int argc,char**argv){
        auto it=productIds.find(ff[5]);
        if(it!=productIds.end())prod=it->second;
       }
-      record=PendingEvent{ff[1],ts,ingest,prod,price,k,true};
+      const int cat=k==2?(prod<0?0:prodCats[prod]):0;
+      out_events.push_back(Event{ts,encode_canonical_user(dsu,ff[1],ids),price,int16_t(cat),uint8_t(k),0});
      }
     }
    }
-   return record;
   };
   for(unsigned r=0;r<workers;++r) {
    for(RowRef row:local[r][t]) {
@@ -834,8 +867,9 @@ int main(int argc,char**argv){
   radix_sort(candidates);
   auto build=[&](RowRef row,i64 ingest){
    if(!csv_split7(row.p,row.n,f))return;
-   auto record=validate(f,ingest);
-   if(record.valid)out_events.push_back(record);
+   validate(f,ingest);
+   // validate() directly appends the compact final Event.
+
   };
   for(size_t i=0;i<candidates.size();) {
    size_t j=i+1;size_t best=i;
@@ -856,8 +890,9 @@ int main(int argc,char**argv){
     i64 ingest=0;
      if(csv_split7(row.p,row.n,ff) && parse_ts(ff[3],ingest)) {
       // The winner is already parsed: avoid parsing the same CSV a second time.
-      auto record=validate(ff,ingest);
-      if(record.valid)out_events.push_back(record);
+      validate(ff,ingest);
+      // validate() directly appends the compact final Event.
+
      }
    }
    for(size_t i=t;i<exception_winners.size();i+=workers){
@@ -866,29 +901,11 @@ int main(int argc,char**argv){
    }
   }
 
-  size_t valid_count=0;
-  for(auto& e:out_events)if(e.valid)out_events[valid_count++]=e;
-  out_events.resize(valid_count);
-  winning[t]=out_events.size();
  });
-
- checkpoint("Parallel exact dedup + event validation");
+ checkpoint("Parallel dedup + validation + fused identity materialization");
  vector<vector<vector<RowRef>>>().swap(local);
- // Fast-path person ID is a reversible 64-bit integer. Unlike V5, we
- // never create a dictionary entry for the ordinary compact ID case.
- // Non-compact IDs use local exact-string dictionaries and a one-time merge.
- vector<LocalPersonKeys> local_names(workers);
- vector<vector<Event>> event_parts(workers);
- worker_error=nullptr;
- launch([&](unsigned t) {
-  auto& dst=event_parts[t];auto& ids=local_names[t];
-  dst.reserve(results[t].size());
-  for(const auto& e:results[t]) {
-   int cat=e.kind==2?(e.prod<0?0:prodCats[e.prod]):0;
-   dst.push_back(Event{e.ts,ids.encode(dsu.canonical(e.user)),e.price,int16_t(cat),uint8_t(e.kind),0});
-  }
-  vector<PendingEvent>().swap(results[t]);
- });
+ // Compact event records were materialized directly during winner validation;
+ // this removes the additional 40-byte PendingEvent pass and allocation.
  unordered_map<string_view,uint64_t,TransparentHash,TransparentEq> special_index;
  vector<string_view> special_names;
  vector<vector<uint64_t>> local_translate(workers);
@@ -1001,7 +1018,7 @@ int main(int argc,char**argv){
    if(!parse_ts(f[3],ts)||ts<ws-WEEK||ts>=we)return;
    auto ci=campaignIds.find(f[2]);
    if(ci==campaignIds.end())return;
-   dest.push_back({ids.encode(dsu.canonical(f[1])),ts,f[0],ci->second});
+   dest.push_back({encode_canonical_user(dsu,f[1],ids),ts,f[0],ci->second});
   };
   for(unsigned j=0;j<workers;++j) {
    for(const auto& row:click_rows[j][t]) {
@@ -1036,24 +1053,44 @@ int main(int argc,char**argv){
     return a.user==b.user?a.ts<b.ts:a.user<b.user;
    });return;
   }
+  // First group by canonical person key. A stable 8-byte radix pass is
+  // unnecessary for time when all we need is ordering *within* each person.
   vector<Event> tmp(v.size());
-  for(int column=0;column<2;++column)for(int byte=0;byte<8;++byte){
+  for(int byte=0;byte<8;++byte) {
    const unsigned shift=byte*8;
    size_t count[256]={};
-   if(column==0){
-    for(const Event& e:v)++count[unsigned((uint64_t(e.ts)^(1ULL<<63))>>shift)&255];
-   } else {
-    for(const Event& e:v)++count[unsigned(e.user>>shift)&255];
-   }
+   for(const Event& e:v)++count[unsigned(e.user>>shift)&255];
    size_t offset[256];size_t sum=0;bool one=false;
    for(int i=0;i<256;++i){offset[i]=sum;sum+=count[i];if(count[i]==v.size())one=true;}
    if(one)continue;
-   if(column==0) {
-    for(const Event& e:v)tmp[offset[unsigned((uint64_t(e.ts)^(1ULL<<63))>>shift)&255]++]=e;
-   }else {
-    for(const Event& e:v)tmp[offset[unsigned(e.user>>shift)&255]++]=e;
-   }
+   for(const Event& e:v)tmp[offset[unsigned(e.user>>shift)&255]++]=e;
    v.swap(tmp);
+  }
+  // Typical users have tens of rows. Small, cache-local std::sort avoids
+  // moving the whole 24-byte event array through another 8 radix passes.
+  for(size_t first=0;first<v.size();) {
+   size_t last=first+1;
+   while(last<v.size() && v[last].user==v[first].user)++last;
+   if(last-first>1) {
+    if(last-first<65536) {
+     sort(v.begin()+first,v.begin()+last,[](const Event&a,const Event&b){return a.ts<b.ts;});
+    }else {
+     // Whales: use local, stable timestamp radix sorting, linear in records.
+     const size_t n=last-first;
+     vector<Event> buf(n);
+     for(int byte=0;byte<8;++byte) {
+      const unsigned shift=byte*8;
+      size_t count[256]={};
+      for(size_t i=first;i<last;++i)++count[unsigned((uint64_t(v[i].ts)^(1ULL<<63))>>shift)&255];
+      size_t off[256];size_t sum=0;bool one=false;
+      for(int j=0;j<256;++j){off[j]=sum;sum+=count[j];if(count[j]==n)one=true;}
+      if(one)continue;
+      for(size_t i=first;i<last;++i)buf[off[unsigned((uint64_t(v[i].ts)^(1ULL<<63))>>shift)&255]++]=v[i];
+      copy(buf.begin(),buf.end(),v.begin()+first);
+     }
+    }
+   }
+   first=last;
   }
  };
  // Disjoint person-owned partitions. No global sort or global session table;
