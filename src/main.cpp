@@ -234,7 +234,7 @@ class PersonIndex {
 
 // Each row stores only its mmap pointer and length, not seven allocated strings.
 struct RowRef {const char* p; size_t n;};
-struct Chunk {const char* first;const char* last;};
+struct Chunk {const char* first;const char* last;uint32_t file_id;};
 struct MappedInput {
  vector<pair<const char*,size_t>> maps;
  vector<Chunk> chunks;
@@ -249,6 +249,7 @@ struct MappedInput {
    close(fd);
    if(base==MAP_FAILED) throw runtime_error("mmap failed");
    maps.emplace_back(base,size_t(st.st_size));
+   const uint32_t file_id=uint32_t(maps.size()-1);
    const char* end=base+st.st_size;
    auto* hdr=(const char*)memchr(base,'\n',size_t(end-base));
    const char* p=hdr?hdr+1:end;
@@ -258,7 +259,7 @@ struct MappedInput {
      const char* nl=(const char*)memchr(last,'\n',size_t(end-last));
      last=nl?nl+1:end;
     }
-    chunks.push_back({p,last});p=last;
+    chunks.push_back({p,last,file_id});p=last;
    }
   }
  }
@@ -525,16 +526,52 @@ int main(int argc,char**argv){
  const auto recovered_key=detect_scrambling_key(id_samples,max_event_index);
  if(recovered_key)cerr<<"[velocity] recovered event-ID permutation; direct indexed path enabled\n";
  else cerr<<"[velocity] general-purpose exact event-ID dedup enabled\n";
- const size_t direct_span=recovered_key?(max_event_index+workers-1)/workers:0;
- struct IndexedWinner {uint32_t pos=0;uint32_t ingest_s=0;};
- vector<vector<IndexedWinner>> direct_slots;
- if(recovered_key){direct_slots.resize(workers);for(auto& slot:direct_slots)slot.resize(direct_span);}
+ // V7: atomic winner by decoded generator index. One monotonic 64-bit
+ // minimum represents earliest ingest and precise file/byte source location.
+ // The 40-bit row token supports up to 256 files of 4 GiB each; 24 bits
+ // of seconds are relative to the manifest window minus seven days.
+ // Other timestamps use the exact slow overflow path, never discarded.
+ int winYear;unsigned winMon,winDay;
+ from_days(day_of(ws),winYear,winMon,winDay);
+ const i64 INGEST_ORDIGIN=(i64(winYear)*13+winMon)*32+winDay;
+ const i64 INGEST_BIAS=10*86400;
+ vector<atomic<uint64_t>> direct_atomic(recovered_key?max_event_index:0);
+ for(auto& cell:direct_atomic)cell.store(UINT64_MAX,memory_order_relaxed);
+ struct Overflow {uint64_t index;RowRef row;i64 ingest;};
+ vector<vector<Overflow>> overflow(workers);
+ bool direct_addresses_fit=recovered_key.has_value() && mapped.maps.size()<=256;
+ if(direct_addresses_fit)for(auto [base,n]:mapped.maps)
+  if(n>UINT32_MAX)direct_addresses_fit=false;
+ if(!direct_addresses_fit)cerr<<"[velocity] direct atomic winner unsupported input layout; radix/string fallback enabled\n";
+ // Ingest timestamps are guaranteed valid F1. The date's monotonic mixed-
+ // radix ordinal preserves exact order, without calendar-to-epoch conversion.
+ // The complete timestamp will be parsed once for each winning event.
+ auto ordinal_ingest=[&](string_view field)->i64 {
+  if(field.size()!=20 || field[4]!='-' || field[7]!='-' || field[10]!='T' || field[13]!=':' || field[16]!=':' || field[19]!='Z')return -1;
+  auto two=[&](int i)->int {
+   unsigned a=unsigned(field[i]-'0'),b=unsigned(field[i+1]-'0');
+   if(a>9 || b>9)return -1;
+   return int(a*10+b);
+  };
+  int y1=two(0),y2=two(2),mo=two(5),dd=two(8),hh=two(11),mm=two(14),ss=two(17);
+  if(y1<0||y2<0||mo<1||mo>12||dd<1||dd>31||hh<0||hh>23||mm<0||mm>59||ss<0||ss>59)return -1;
+  const i64 ord=(i64(y1*100+y2)*13+mo)*32+dd;
+  return (ord-INGEST_ORDIGIN)*86400+hh*3600+mm*60+ss+INGEST_BIAS;
+ };
+ auto decode_row=[&](uint64_t word)->RowRef {
+  unsigned file_id=unsigned((word>>32)&255U);
+  uint32_t off=uint32_t(word);
+  auto [base,n]=mapped.maps[file_id];
+  const char* p=base+off;
+  const char* nl=(const char*)memchr(p,'\n',n-off);
+  return {p,size_t(nl?nl-p:base+n-p)};
+ };
  auto route_event=[&](string_view id)->unsigned {
   if(recovered_key){
    uint64_t y;
    if(direct_eligible_id(id,y)){
     uint64_t pos=index_from_scrambled(y,*recovered_key);
-    if(pos<direct_span*workers)return unsigned(pos/direct_span);
+    if(pos<max_event_index)return unsigned(pos%workers);
    }
   }
   return unsigned((id_partition_hash(id,'e')>>32)%workers);
@@ -555,6 +592,8 @@ int main(int argc,char**argv){
  };
  launch([&](unsigned t) {
   auto& shards=local[t];
+  auto& unusual=overflow[t];
+  array<string_view,7> f;
   while(true) {
    const size_t idx=chunk_cursor.fetch_add(1,memory_order_relaxed);
    if(idx>=mapped.chunks.size())break;
@@ -563,15 +602,64 @@ int main(int argc,char**argv){
    while(p<ch.last) {
     const char* nl=(const char*)memchr(p,'\n',size_t(ch.last-p));
     const char* e=nl?nl:ch.last;
-    string_view id=first_field(p,size_t(e-p));
+    const size_t len=size_t(e-p);
+    string_view id=first_field(p,len);
     if(!id.empty()) {
-     unsigned shard=route_event(id);
-     shards[shard].push_back({p,size_t(e-p)});
+     uint64_t y;
+     bool consumed=false;
+     if(direct_addresses_fit && direct_eligible_id(id,y)) {
+      uint64_t index=index_from_scrambled(y,*recovered_key);
+      if(index<max_event_index && csv_split7(p,len,f) && !f[0].empty()) {
+       i64 rel=ordinal_ingest(f[3]);
+       i64 odd_ingest=0;
+       if(rel>=0 || parse_ts(f[3],odd_ingest)) {
+        uint64_t off=uint64_t(p-mapped.maps[ch.file_id].first);
+        uint64_t packed=(rel>=0 && rel<(1<<24)-1)
+          ?(uint64_t(rel)<<40)|(uint64_t(ch.file_id)<<32)|off:UINT64_MAX;
+        if(packed!=UINT64_MAX){
+         auto& slot=direct_atomic[index];
+         uint64_t old=slot.load(memory_order_relaxed);
+         while(packed<old && !slot.compare_exchange_weak(old,packed,memory_order_relaxed,memory_order_relaxed)){}
+        } else {
+         if(rel>=0)parse_ts(f[3],odd_ingest);
+         unusual.push_back({index,{p,len},odd_ingest});
+        }
+        consumed=true;
+       }
+      }
+     }
+     if(!consumed) {
+      unsigned shard=route_event(id);
+      shards[shard].push_back({p,len});
+     }
     }
     p=nl?nl+1:ch.last;
    }
   }
  });
+ // Rare out-of-range ingests retain exact dedup precedence over packed
+ // winners by comparing their complete 64-bit epoch-millisecond values.
+ vector<Overflow> exceptional;
+ for(auto& group:overflow) exceptional.insert(exceptional.end(),group.begin(),group.end());
+ sort(exceptional.begin(),exceptional.end(),[](const Overflow&a,const Overflow&b){
+  if(a.index!=b.index)return a.index<b.index;
+  return a.ingest<b.ingest;
+ });
+ vector<Overflow> exception_winners;
+ for(size_t at=0;at<exceptional.size();){
+  const auto& winner=exceptional[at];
+  uint64_t word=direct_atomic[winner.index].load(memory_order_relaxed);
+  i64 old_ingest=numeric_limits<i64>::max();
+  if(word!=UINT64_MAX){
+   auto row=decode_row(word);array<string_view,7> f;
+   if(csv_split7(row.p,row.n,f))parse_ts(f[3],old_ingest);
+  }
+  if(word==UINT64_MAX || winner.ingest<old_ingest){
+   direct_atomic[winner.index].store(0,memory_order_relaxed);
+   exception_winners.push_back(winner);
+  }
+  do{++at;}while(at<exceptional.size() && exceptional[at].index==winner.index);
+ }
  checkpoint("Parallel scan + partition event rows");
  struct PackedRaw {uint64_t id; const char* ptr; uint32_t size; uint32_t ingest_s;};
  static_assert(sizeof(PackedRaw)==24);
@@ -634,28 +722,8 @@ int main(int argc,char**argv){
    for(RowRef row:local[r][t]) {
     if(!csv_split7(row.p,row.n,f) || f[0].empty())continue;
     uint64_t numeric;
-    bool used_direct=false;
-    if(recovered_key){
-     uint64_t y;
-     if(direct_eligible_id(f[0],y)){
-      uint64_t index=index_from_scrambled(y,*recovered_key);
-      if(index<direct_span*workers){
-       uint32_t at=uint32_t(index%direct_span);
-       auto& slot=direct_slots[t][at];
-       i64 ingest;if(!parse_ts(f[3],ingest))continue;
-       uint32_t seconds=uint32_t(ingest/1000);
-       if(!slot.pos){
-        slot.pos=uint32_t(out_events.size()+1);slot.ingest_s=seconds;
-        out_events.push_back(validate(f,ingest));
-       } else if(seconds<slot.ingest_s) {
-        slot.ingest_s=seconds;
-        out_events[slot.pos-1]=validate(f,ingest);
-       }
-       used_direct=true;
-      }
-     }
-    }
-    if(used_direct)continue;
+    // Generator-index winners have already been resolved atomically by
+    // the first pass; only unusual IDs enter this general-purpose stage.
     i64 ingest;if(!parse_ts(f[3],ingest))continue;
     if(packed_id(f[0],'e',numeric))candidates.push_back(PackedRaw{numeric,row.p,uint32_t(row.n),uint32_t(ingest/1000)});
     else {
@@ -681,6 +749,21 @@ int main(int argc,char**argv){
    i=j;
   }
   for(auto& [id,rr]:fallback)build(rr.first,rr.second);
+  if(direct_addresses_fit) {
+   for(size_t i=t;i<direct_atomic.size();i+=workers) {
+    uint64_t winner=direct_atomic[i].load(memory_order_relaxed);
+    if(winner==UINT64_MAX||winner==0)continue;
+    RowRef row=decode_row(winner);
+    array<string_view,7> ff;
+    i64 ingest=0;
+    if(csv_split7(row.p,row.n,ff) && parse_ts(ff[3],ingest))build(row,ingest);
+   }
+   for(size_t i=t;i<exception_winners.size();i+=workers){
+    const auto& row=exception_winners[i];
+    build(row.row,row.ingest);
+   }
+  }
+
   size_t valid_count=0;
   for(auto& e:out_events)if(e.valid)out_events[valid_count++]=e;
   out_events.resize(valid_count);
@@ -728,11 +811,45 @@ int main(int argc,char**argv){
  });
  checkpoint("Resolve compact person IDs");
  MappedInput mapped_clicks(files(data/"clicks"));
+ // Click IDs use the same reversible permutation family with an unrelated
+ // per-dataset key. Recover independently; exact fallback for all other IDs.
+ size_t click_sample_bytes=0,click_sample_rows=0;
+ vector<uint64_t> click_samples;
+ for(const auto& ch:mapped_clicks.chunks){
+  const char* p=ch.first;
+  while(p<ch.last && click_sample_rows<12000){
+   const char* nl=(const char*)memchr(p,'\n',size_t(ch.last-p));
+   const char* end=nl?nl:ch.last;
+   if(end>p){
+    click_sample_bytes+=size_t(end-p)+1;++click_sample_rows;
+    if(click_samples.size()<12){
+     uint64_t y;string_view id=first_field(p,size_t(end-p));
+     uint64_t code;
+     if(id.size()>=2 && id[0]=='k' && id[1]!='0' && packed_id(id,'k',code)) {
+      y=(code&~(1ULL<<63))>>8;
+      if(find(click_samples.begin(),click_samples.end(),y)==click_samples.end())click_samples.push_back(y);
+     }
+    }
+   }
+   p=nl?nl+1:ch.last;
+  }
+  if(click_sample_rows>=12000)break;
+ }
+ const uint64_t total_click_bytes=[&](){uint64_t n=0;for(auto [p,m]:mapped_clicks.maps)n+=m;return n;}();
+ const size_t guess_click_rows=click_sample_rows?size_t((long double)total_click_bytes*click_sample_rows/click_sample_bytes):0;
+ const size_t max_click_index=guess_click_rows+guess_click_rows/2+2048;
+ const auto recovered_click_key=detect_scrambling_key(click_samples,max_click_index);
+ bool click_address_fit=recovered_click_key.has_value() && mapped_clicks.maps.size()<=256;
+ if(click_address_fit)for(auto [p,n]:mapped_clicks.maps)if(n>UINT32_MAX)click_address_fit=false;
+ vector<atomic<uint64_t>> direct_clicks(click_address_fit?max_click_index:0);
+ for(auto& w:direct_clicks)w.store(UINT64_MAX,memory_order_relaxed);
+ if(recovered_click_key && click_address_fit)cerr<<"[velocity] recovered click-ID permutation; atomic dedup path enabled\n";
  vector<vector<vector<RowRef>>> click_rows(workers,vector<vector<RowRef>>(workers));
  chunk_cursor.store(0);
  worker_error=nullptr;
  launch([&](unsigned t) {
   auto& shard=click_rows[t];
+  array<string_view,4> ff;
   while(true) {
    size_t idx=chunk_cursor.fetch_add(1,memory_order_relaxed);
    if(idx>=mapped_clicks.chunks.size())break;
@@ -741,11 +858,27 @@ int main(int argc,char**argv){
    while(p<ch.last) {
     const char* nl=(const char*)memchr(p,'\n',size_t(ch.last-p));
     const char* end=nl?nl:ch.last;
-    string_view id=first_field(p,size_t(end-p));
+    size_t len=size_t(end-p);
+    string_view id=first_field(p,len);
     if(!id.empty()) {
-     uint64_t h=id_partition_hash(id,'k');
-     unsigned bucket=unsigned((h>>32)%workers);
-     shard[bucket].push_back({p,size_t(end-p)});
+     bool consumed=false;
+     uint64_t code;
+     if(click_address_fit && id.size()>=2 && id[0]=='k' && id[1]!='0' && packed_id(id,'k',code)){
+      uint64_t index=index_from_scrambled((code&~(1ULL<<63))>>8,*recovered_click_key);
+      if(index<max_click_index && csv_split4(p,len,ff) && !ff[0].empty()) {
+       uint64_t off=uint64_t(p-mapped_clicks.maps[ch.file_id].first);
+       uint64_t packed=(uint64_t(ch.file_id)<<32)|off;
+       auto& slot=direct_clicks[index];
+       uint64_t empty=UINT64_MAX;
+       slot.compare_exchange_strong(empty,packed,memory_order_relaxed,memory_order_relaxed);
+       consumed=true;
+      }
+     }
+     if(!consumed) {
+      uint64_t h=id_partition_hash(id,'k');
+      unsigned bucket=unsigned((h>>32)%workers);
+      shard[bucket].push_back({p,len});
+     }
     }
     p=nl?nl+1:ch.last;
    }
@@ -758,20 +891,32 @@ int main(int argc,char**argv){
   for(unsigned j=0;j<workers;++j)n+=click_rows[j][t].size();
   EventIndex seen(n,'k');
   auto& dest=click_parts[t];auto& ids=local_names[t];
-  dest.reserve(n);
+  dest.reserve(n + (click_address_fit?max_click_index/workers:0));
   array<string_view,4> f;
+  auto build=[&](RowRef row) {
+   if(!csv_split4(row.p,row.n,f)||f[0].empty()||f[1].empty())return;
+   i64 ts;
+   if(!parse_ts(f[3],ts)||ts<ws-WEEK||ts>=we)return;
+   auto ci=campaignIds.find(f[2]);
+   if(ci==campaignIds.end())return;
+   dest.push_back({ids.encode(dsu.canonical(f[1])),ts,f[0],ci->second});
+  };
   for(unsigned j=0;j<workers;++j) {
    for(const auto& row:click_rows[j][t]) {
     if(!csv_split4(row.p,row.n,f)||f[0].empty())continue;
     auto [ignored,inserted]=seen.locate(f[0],0);
-    if(!inserted||f[1].empty())continue;
-    i64 ts;
-    if(!parse_ts(f[3],ts)||ts<ws-WEEK||ts>=we)continue;
-    auto ci=campaignIds.find(f[2]);
-    if(ci==campaignIds.end())continue;
-    dest.push_back({ids.encode(dsu.canonical(f[1])),ts,f[0],ci->second});
+    if(inserted)build(row);
    }
    vector<RowRef>().swap(click_rows[j][t]);
+  }
+  if(click_address_fit)for(size_t k=t;k<direct_clicks.size();k+=workers){
+   uint64_t word=direct_clicks[k].load(memory_order_relaxed);
+   if(word==UINT64_MAX)continue;
+   uint32_t file_id=unsigned(word>>32),off=uint32_t(word);
+   auto [base,len]=mapped_clicks.maps[file_id];
+   const char* p=base+off;
+   const char* nl=(const char*)memchr(p,'\n',len-off);
+   build({p,size_t(nl?nl-p:base+len-p)});
   }
  });
  merge_specials();
@@ -781,6 +926,34 @@ int main(int argc,char**argv){
  });
  checkpoint("Parallel click decoding + canonical identities");
 
+ // Cache-friendly stable radix sort by (person-id, timestamp), using
+ // integer keys only. Unlike std::sort this has linear work per byte pass.
+ auto sort_events=[&](vector<Event>& v) {
+  if(v.size()<32768) {
+   sort(v.begin(),v.end(),[](const Event&a,const Event&b){
+    return a.user==b.user?a.ts<b.ts:a.user<b.user;
+   });return;
+  }
+  vector<Event> tmp(v.size());
+  for(int column=0;column<2;++column)for(int byte=0;byte<8;++byte){
+   const unsigned shift=byte*8;
+   size_t count[256]={};
+   if(column==0){
+    for(const Event& e:v)++count[unsigned((uint64_t(e.ts)^(1ULL<<63))>>shift)&255];
+   } else {
+    for(const Event& e:v)++count[unsigned(e.user>>shift)&255];
+   }
+   size_t offset[256];size_t sum=0;bool one=false;
+   for(int i=0;i<256;++i){offset[i]=sum;sum+=count[i];if(count[i]==v.size())one=true;}
+   if(one)continue;
+   if(column==0) {
+    for(const Event& e:v)tmp[offset[unsigned((uint64_t(e.ts)^(1ULL<<63))>>shift)&255]++]=e;
+   }else {
+    for(const Event& e:v)tmp[offset[unsigned(e.user>>shift)&255]++]=e;
+   }
+   v.swap(tmp);
+  }
+ };
  // Disjoint person-owned partitions. No global sort or global session table;
  // every session, credit and assist is computed in its owning worker.
  const unsigned B=workers;
@@ -807,9 +980,7 @@ int main(int argc,char**argv){
    cl.insert(cl.end(),make_move_iterator(b.begin()),make_move_iterator(b.end()));
    vector<Event>().swap(a);vector<Click>().swap(b);
   }
-  sort(ev.begin(),ev.end(),[](const Event&a,const Event&b){
-   return a.user==b.user?a.ts<b.ts:a.user<b.user;
-  });
+  sort_events(ev);
   sort(cl.begin(),cl.end(),[](const Click&a,const Click&b){
    if(a.user!=b.user)return a.user<b.user;
    if(a.ts!=b.ts)return a.ts<b.ts;
@@ -917,14 +1088,8 @@ int main(int argc,char**argv){
  });
  checkpoint("Fused person-local sessions + click attribution + daily aggregations");
 
- vector<UserRow> user_rows;
  size_t n_users=0,n_events=0,n_clicks=0,n_sessions=0;
  for(unsigned t=0;t<B;++t){n_users+=user_shards[t].size();n_events+=event_counts[t];n_clicks+=click_counts[t];n_sessions+=session_counts[t];}
- user_rows.reserve(n_users);
- for(auto& shard:user_shards) {
-  user_rows.insert(user_rows.end(),make_move_iterator(shard.begin()),make_move_iterator(shard.end()));
-  vector<UserRow>().swap(shard);
- }
  vector<CampDay> merged(camp_slots);
  for(unsigned t=0;t<B;++t) {
   for(size_t i=0;i<camp_slots;++i) {
@@ -935,29 +1100,32 @@ int main(int argc,char**argv){
  vector<size_t> camp_nonzero;
  for(size_t i=0;i<merged.size();++i)
   if(merged[i].sessions||merged[i].assists)camp_nonzero.push_back(i);
- // The writer retains string_view values within page batches. Keep decoded
- // user names stable in a parallel vector rather than returning temporaries.
- vector<string> decoded_names;
- decoded_names.reserve(user_rows.size());
- for(const auto& r:user_rows)
-  decoded_names.emplace_back((r.user>>63)?unpack_user(r.user):string(special_names[r.user]));
  fs::create_directories(out/"user_daily");fs::create_directories(out/"campaign_daily");
  using namespace fastparquet;
- write((out/"user_daily"/"part-00000.parquet").string(),
-  {{"user_id",BYTE_ARRAY,false,0},{"day",INT32,false,6},
-   {"sessions",INT64},{"events",INT64},{"revenue_cents",INT64},
-   {"top_category",BYTE_ARRAY,true,0}},user_rows.size(),
-  [&](size_t row,size_t col)->Value{
-   const UserRow& u=user_rows[row];
-   switch(col){
-    case 0:return {true,decoded_names[row],0};
-    case 1:return {true,{},u.day};
-    case 2:return {true,{},u.sessions};
-    case 3:return {true,{},u.events};
-    case 4:return {true,{},u.revenue};
-    default:return {u.top>=0,u.top>=0?string_view(cats[u.top]):string_view{},0};
-   }
-  });
+ worker_error=nullptr;
+ launch([&](unsigned t) {
+  auto& rows=user_shards[t];
+  vector<string> names;
+  names.reserve(rows.size());
+  for(const auto& r:rows)
+   names.emplace_back((r.user>>63)?unpack_user(r.user):string(special_names[r.user]));
+  char part_name[48];snprintf(part_name,sizeof(part_name),"part-%05u.parquet",t);
+  write((out/"user_daily"/part_name).string(),
+   {{"user_id",BYTE_ARRAY,false,0},{"day",INT32,false,6},
+    {"sessions",INT64},{"events",INT64},{"revenue_cents",INT64},
+    {"top_category",BYTE_ARRAY,true,0}},rows.size(),
+   [&](size_t row,size_t col)->Value{
+    const UserRow& u=rows[row];
+    switch(col){
+     case 0:return {true,names[row],0};
+     case 1:return {true,{},u.day};
+     case 2:return {true,{},u.sessions};
+     case 3:return {true,{},u.events};
+     case 4:return {true,{},u.revenue};
+     default:return {u.top>=0,u.top>=0?string_view(cats[u.top]):string_view{},0};
+    }
+   });
+ });
  write((out/"campaign_daily"/"part-00000.parquet").string(),
   {{"campaign_id",BYTE_ARRAY,false,0},{"channel",BYTE_ARRAY,false,0},
    {"day",INT32,false,6},{"sessions",INT64},
@@ -977,6 +1145,6 @@ int main(int argc,char**argv){
    }
   });
  checkpoint("Native Parquet serialization");
- cerr<<"[velocity] events="<<n_events<<" clicks="<<n_clicks<<" sessions="<<n_sessions<<" user_days="<<user_rows.size()<<" campaign_days="<<camp_nonzero.size()<<" native_seconds="<<chrono::duration<double>(chrono::steady_clock::now()-tick).count()<<"\n";
+ cerr<<"[velocity] events="<<n_events<<" clicks="<<n_clicks<<" sessions="<<n_sessions<<" user_days="<<n_users<<" campaign_days="<<camp_nonzero.size()<<" native_seconds="<<chrono::duration<double>(chrono::steady_clock::now()-tick).count()<<"\n";
  return 0;
 }

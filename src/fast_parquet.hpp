@@ -121,21 +121,22 @@ void write(const std::string& path,const std::vector<Column>& cols,size_t nrows,
    for(size_t off=0;off<count;off+=PAGE){
     int len=int(std::min(PAGE,count-off));
     std::string payload;
-    std::vector<Value> values;
-    values.reserve(len);
-    for(int i=0;i<len;++i)values.push_back(get(g+off+i,col));
+    payload.reserve(size_t(len)*(cols[col].type==BYTE_ARRAY?18:
+      cols[col].type==INT32?4:8)+512);
     if(cols[col].optional){
      std::string defs;
      int blocks=(len+7)/8;
+     defs.reserve(size_t(blocks)+8);
      leb(defs,uint64_t(blocks*2+1));
      for(int b=0;b<blocks;b++){
       u8 bits=0;
-      for(int j=0;j<8;j++)if(b*8+j<len && values[b*8+j].valid)bits|=u8(1<<j);
+      for(int j=0;j<8;j++)if(b*8+j<len && get(g+off+b*8+j,col).valid)bits|=u8(1<<j);
       defs.push_back(char(bits));
      }
      le32(payload,u32(defs.size()));payload+=defs;
     }
-    for(const Value& v:values){
+    for(int i=0;i<len;++i){
+     const Value v=get(g+off+i,col);
      if(!v.valid)continue;
      if(cols[col].type==BYTE_ARRAY){le32(payload,u32(v.text.size()));payload.append(v.text.data(),v.text.size());}
      else if(cols[col].type==INT32)le32(payload,u32(v.number));
